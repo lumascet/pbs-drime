@@ -1,0 +1,39 @@
+# /etc/drime-s3gw/config.toml  (chmod 600, owned by root)
+#
+# Secrets can also come from the environment instead of this file:
+#   DRIME_S3GW_ACCESS_KEY, DRIME_S3GW_SECRET_KEY, DRIME_S3GW_DRIME_TOKEN
+
+# Credentials PBS uses to talk to the gateway (make up long random strings,
+# e.g. `openssl rand -hex 24`). Enter the same values in the PBS S3 endpoint.
+access_key = "CHANGE-ME"
+secret_key = "CHANGE-ME"
+
+# Drime personal access token: app.drime.cloud -> Settings -> Developers ->
+# "Create token" (permission "All", or Restricted with read+write on files).
+drime_token = "CHANGE-ME"
+
+# The one bucket this gateway serves. Use the same name in the PBS datastore.
+bucket = "pbs"
+# Any value, but it must match the region set on the PBS S3 endpoint.
+region = "us-west-1"
+
+listen = "127.0.0.1"
+port = 8443
+tls = true                       # PBS only speaks HTTPS
+cert = "/etc/drime-s3gw/cert.pem"
+key = "/etc/drime-s3gw/key.pem"
+
+# Drime folder (created if missing) that holds everything; may be nested ("a/b").
+drime_root = "pbs-s3"
+workspace_id = 0                 # 0 = personal space
+
+# Local key -> Drime entry index. Losing it is recoverable (`rebuild-index`).
+index_db = "/var/lib/drime-s3gw/index.sqlite"
+
+hard_delete = true               # GC'd chunks skip the Drime trash
+requests_per_minute = 1500       # Drime allows ~2000 API requests/min per account
+max_inflight = 16                # concurrent Drime uploads/downloads
+retries = 6
+http_timeout = 300
+max_object_size = 268435456      # 256 MiB; PBS objects are normally <= 16 MiB
+log_level = "INFO"               # DEBUG logs every request
