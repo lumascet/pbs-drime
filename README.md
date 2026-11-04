@@ -171,6 +171,27 @@ systemctl daemon-reload && systemctl enable --now drime-s3gw-usage@drime.timer
 - **Warning before the limit:** above `usage_warn_percent` (default 90%), the usage unit exits 1 about
   once a day. Hook an `OnFailure=` alert to it.
 
+**Optional: show the Drime usage in the PBS gauge itself.** Put the cache directory on a sparse ext4
+image whose size equals `max_total_size`, and let the usage timer fallocate a reservation file so the
+filesystem reports the Drime usage as "used":
+
+```bash
+zfs set mountpoint=/var/lib/pbs-drime-img rpool/pbs-drime-cache   # cache dataset becomes the image's home
+truncate -s 3T /var/lib/pbs-drime-img/cache.img
+mkfs.ext4 -F -m 0 -N 1000000 -I 256 -J size=64 -E lazy_itable_init=1,lazy_journal_init=1 /var/lib/pbs-drime-img/cache.img
+echo '/var/lib/pbs-drime-img/cache.img /mnt/pbs-drime-cache ext4 loop,nofail,x-systemd.requires-mounts-for=/var/lib/pbs-drime-img 0 0' >> /etc/fstab
+# move the datastore's metadata into it (PBS stopped), then:
+# drime-s3gw usage --pbs-comment drime --reserve-file /mnt/pbs-drime-cache/.drime-usage/reserve
+```
+
+How it stays light on the SSD:
+- **No real data:** `fallocate` only allocates blocks; nothing is written.
+- **Zero blocks:** with ZFS compression enabled, ext4's zeroed inode tables are stored as holes.
+- **Small inode count:** the cache directory only holds metadata (`.chunks` lives on tmpfs), so
+  `-N 1000000` is plenty.
+
+The reservation always leaves at least 2 GiB available, so PBS's own cache keeps working.
+
 ### Hardening
 
 ```bash

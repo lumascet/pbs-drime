@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -91,6 +91,10 @@ class Config:
     # an error); metadata writes, deletes and GC keep working so space can be freed.
     max_total_size: str = ""
     usage_warn_percent: int = 90  # `usage` exits 1 (once a day) above this share of the limit
+    # Bandwidth caps for all traffic to/from Drime (backups, verify/read-back, read-ahead,
+    # scrub), e.g. "200Mbit", "25MiB", "30MB" per second; empty = unlimited.
+    upload_limit: str = ""
+    download_limit: str = ""
     log_level: str = "INFO"
 
     @classmethod
@@ -166,13 +170,52 @@ class RateLimiter:
             time.sleep(wait)
 
 
+def parse_rate(s) -> int:
+    """'200Mbit' / '200 mbps' -> bytes/s; '25MiB' / '30MB' -> bytes/s; '' -> 0 (unlimited)."""
+    if not s:
+        return 0
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*?)\s*(?:/s)?\s*", str(s))
+    if not m:
+        raise SystemExit(f"invalid rate {s!r} (examples: 200Mbit, 25MiB)")
+    num, unit = float(m.group(1)), m.group(2).lower()
+    bits = {"bit": 1, "bps": 1, "kbit": 1e3, "kbps": 1e3, "mbit": 1e6, "mbps": 1e6, "gbit": 1e9, "gbps": 1e9}
+    if unit in bits:
+        return int(num * bits[unit] / 8)
+    if unit in _UNITS:
+        return int(num * _UNITS[unit])
+    raise SystemExit(f"invalid rate unit in {s!r} (examples: 200Mbit, 25MiB)")
+
+
+class ByteRate:
+    """Shared token bucket in bytes per second (one per direction). A transfer reserves its
+    size and sleeps until the bucket allows it, so the long-run rate never exceeds the cap."""
+
+    def __init__(self, rate: int):
+        self.rate = rate
+        self.lock = threading.Lock()
+        self.next_free = time.monotonic()
+
+    def consume(self, n: int) -> None:
+        if not self.rate or n <= 0:
+            return
+        with self.lock:
+            now = time.monotonic()
+            start = max(now, self.next_free)
+            self.next_free = start + n / self.rate
+            wait = start - now
+        if wait > 0:
+            time.sleep(wait)
+
+
 class HTTP:
     """Keep-alive connections per thread and host; redirects drop auth across hosts."""
 
-    def __init__(self, timeout: float):
+    def __init__(self, timeout: float, up: "ByteRate | None" = None, down: "ByteRate | None" = None):
         self.timeout = timeout
         self.local = threading.local()
         self.ctx = ssl.create_default_context()
+        self.up = up or ByteRate(0)
+        self.down = down or ByteRate(0)
 
     def _pool(self) -> dict:
         pool = getattr(self.local, "pool", None)
@@ -202,6 +245,8 @@ class HTTP:
             u = urllib.parse.urlsplit(url)
             target = (u.path or "/") + (("?" + u.query) if u.query else "")
             conn = self._conn(u.scheme, u.netloc)
+            if body:
+                self.up.consume(len(body))
             try:
                 conn.request(method, target, body=body, headers=headers)
                 resp = conn.getresponse()
@@ -211,6 +256,8 @@ class HTTP:
                 raise
             if resp.will_close:
                 self._drop(u.scheme, u.netloc)
+            if len(data) > 64 * 1024:
+                self.down.consume(len(data))  # throttles the next request of this thread
             location = resp.getheader("Location")
             if follow and resp.status in (301, 302, 303, 307, 308) and location:
                 new = urllib.parse.urljoin(url, location)
@@ -234,7 +281,8 @@ class Drime:
         self.api = cfg.drime_api.rstrip("/")
         u = urllib.parse.urlsplit(self.api)
         self.site = f"{u.scheme}://{u.netloc}/"
-        self.http = HTTP(cfg.http_timeout)
+        self.http = HTTP(cfg.http_timeout, ByteRate(parse_rate(cfg.upload_limit)),
+                         ByteRate(parse_rate(cfg.download_limit)))
         self.limiter = RateLimiter(cfg.requests_per_minute)
         self.ws = cfg.workspace_id
 
@@ -1919,6 +1967,11 @@ def cmd_serve(cfg: Config, args) -> int:
              cfg.drime_root, n, size / 1024 ** 3)
     if store.limit:
         log.info("storage limit %s (%.1f%% used)", fmt_size(store.limit), 100.0 * size / store.limit)
+    up, down = parse_rate(cfg.upload_limit), parse_rate(cfg.download_limit)
+    if up or down:
+        log.info("bandwidth limits: upload %s, download %s",
+                 f"{up * 8 / 1e6:.0f} Mbit/s" if up else "unlimited",
+                 f"{down * 8 / 1e6:.0f} Mbit/s" if down else "unlimited")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -2034,6 +2087,8 @@ def cmd_usage(cfg: Config, args) -> int:
                            capture_output=True, text=True)
         print(f"PBS datastore {ds!r} comment: {text}" if r.returncode == 0
               else f"could not update PBS comment: {r.stderr.strip()}")
+    if args.reserve_file:
+        _sync_reservation(args.reserve_file, used)
     if limit and pct >= cfg.usage_warn_percent:
         state = os.path.join(os.path.dirname(os.path.abspath(cfg.index_db)), "usage-alert")
         last = os.path.getmtime(state) if os.path.exists(state) else 0
@@ -2042,6 +2097,36 @@ def cmd_usage(cfg: Config, args) -> int:
             open(state, "w").close()
             return 1  # -> OnFailure alert, at most about once a day
     return 0
+
+
+def _sync_reservation(path: str, target_used: int, keep_free: int = 2 * 1024 ** 3) -> None:
+    """Make the filesystem holding `path` report about `target_used` bytes as used, by
+    fallocate()-ing `path` (allocation only, no data written). Used so PBS's datastore gauge,
+    which reads statfs() of the cache directory, shows the Drime usage. Always leaves
+    `keep_free` available so PBS's cache keeps working."""
+    if not hasattr(os, "posix_fallocate"):
+        raise SystemExit("--reserve-file needs Linux (posix_fallocate)")
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        cur = os.fstat(fd).st_blocks * 512
+        st = os.statvfs(d)
+        total = st.f_blocks * st.f_frsize
+        used = total - st.f_bfree * st.f_frsize
+        other = used - cur  # everything on the filesystem except our reservation
+        want = max(0, min(target_used - other, total - other - keep_free))
+        want -= want % st.f_frsize
+        if want < cur:
+            os.ftruncate(fd, want)
+        elif want > cur:
+            os.posix_fallocate(fd, 0, want)
+        after = os.statvfs(d)
+        shown = (after.f_blocks - after.f_bfree) * after.f_frsize
+        print(f"gauge reservation {fmt_size(want)}: filesystem now shows {fmt_size(shown)} used "
+              f"of {fmt_size(after.f_blocks * after.f_frsize)}")
+    finally:
+        os.close(fd)
 
 
 def cmd_migrate(cfg: Config, args) -> int:
@@ -2177,6 +2262,9 @@ def main(argv=None) -> int:
     us = sub.add_parser("usage", help="show storage used on Drime (and the limit)")
     us.add_argument("--pbs-comment", metavar="DATASTORE",
                     help="also write the usage into this PBS datastore's comment")
+    us.add_argument("--reserve-file", metavar="PATH",
+                    help="fallocate this file so its filesystem shows the Drime usage as 'used' "
+                         "(for the PBS gauge; see README)")
     mg = sub.add_parser("migrate-layout", help="move 0.1.0-layout chunks into the current layout")
     mg.add_argument("--dry-run", action="store_true")
     pf = sub.add_parser("prefill", help="create all 4096 chunk folders of a datastore up front")

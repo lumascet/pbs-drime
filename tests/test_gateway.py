@@ -467,6 +467,30 @@ class GatewayTest(unittest.TestCase):
         finally:
             self.store.limit = old_limit
 
+    def test_bandwidth_limits(self):
+        self.assertEqual(gw.parse_rate("200Mbit"), 25_000_000)
+        self.assertEqual(gw.parse_rate("25MiB"), 25 * 1024 ** 2)
+        self.assertEqual(gw.parse_rate("100 mbps"), 12_500_000)
+        self.assertEqual(gw.parse_rate(""), 0)
+        cfg2 = gw.Config(**{f.name: getattr(self.cfg, f.name) for f in gw.fields(gw.Config)})
+        cfg2.upload_limit, cfg2.download_limit = "8Mbit", "8Mbit"  # 1 MB/s each
+        cfg2.verify_uploads = False
+        d2 = gw.Drime(cfg2)
+        pid = self.store.folder_id(("bw",))
+        data = os.urandom(250_000)
+        t0 = time.monotonic()
+        items = [d2.upload_small(pid, f"bw{i}", data) for i in range(6)]  # 1.5 MB at 1 MB/s
+        up_dt = time.monotonic() - t0
+        t0 = time.monotonic()
+        for it in items:
+            self.assertEqual(d2.download(it.get("url"), it.get("hash")), data)
+        down_dt = time.monotonic() - t0
+        print(f"\n  1.5 MB at 8 Mbit/s caps: upload {up_dt:.2f} s, download {down_dt:.2f} s")
+        d2.delete([pid], True)  # these files bypassed the index; don't leave orphans behind
+        self.store.index.forget_folders("/".join(self.store.root_parts + ("bw",)))
+        self.assertGreater(up_dt, 1.0)
+        self.assertGreater(down_dt, 0.9)
+
     def test_migrate_old_layout(self):
         # objects as 0.1.0 stored them: .chunks/ab/cd/<digest>
         datas = [os.urandom(3000 + i) for i in range(6)]
