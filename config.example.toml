@@ -40,4 +40,7 @@ max_object_size = 268435456      # 256 MiB; PBS objects are normally <= 16 MiB
 verify_uploads = true            # read 1 byte back after each upload; Drime has been seen
                                  # acknowledging uploads whose data never reached storage
 prefill_chunk_folders = true     # create a datastore's 4096 chunk folders in the background
+readahead = true                 # restores: prefetch the next chunks of the snapshot being read
+readahead_window = 24            # chunks fetched ahead in parallel
+readahead_cache_mib = 256        # RAM for prefetched chunks
 log_level = "INFO"               # DEBUG logs every request

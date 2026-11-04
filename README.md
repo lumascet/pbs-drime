@@ -229,6 +229,14 @@ wait entirely.
   - **Measured on a 250 Mbit/s uplink:** real PBS backups reached 26–30 MiB/s, about 220–250 Mbit/s,
     with 64 uploads in flight. That is essentially the full line.
   - **Verify:** with 32 readers, verify read at about 100 MiB/s.
+  - **Restores:** PBS restores fetch chunks strictly one at a time. Without help they run at
+    chunk size divided by latency, about 10 MiB/s here. The gateway therefore remembers the chunk
+    order of every index file PBS writes (`.didx`/`.fidx`, about 8 MB per TB per snapshot).
+    When a chunk is requested, it fetches the next `readahead_window` chunks (default 24) in
+    parallel into a RAM cache (`readahead_cache_mib`, default 256).
+    - **Measured:** a sequential 1.2 GiB restore read went from 9.9 to **67 MiB/s**, with no
+      wasted prefetches.
+    - **Safeguard:** read-ahead for a snapshot stops if its prefetched chunks go unused.
   - **Drime has slow periods:** at times its download redirect took 5–10 s instead of about 0.1 s,
     and folder creation dropped to about 1 per second.
 

@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import http.client
 import os
+import random
 import shutil
 import ssl
 import subprocess
@@ -439,6 +440,56 @@ class GatewayTest(unittest.TestCase):
         st = self.store.scrub(f"{STORE}/heal/")
         self.assertEqual((st["checked"], st["lost"]), (2, 1))
         self.assertIsNone(self.store.index.get(f"{STORE}/{key2}"))
+
+    def _snapshot(self, name, n, ext=".didx"):
+        """Upload n chunks plus a PBS-style index file listing them; returns [(key, data)]."""
+        ct = {"content-type": "application/octet-stream", "if-none-match": "*"}
+        chunks, entries, off = [], b"", 0
+        for i in range(n):
+            data = os.urandom(64_000 + i)
+            h = hashlib.sha256(data).hexdigest()
+            key = f".chunks/{h[:4]}/{h}"
+            self.assertEqual(self.pbs.request("PUT", key, body=data, headers=ct)[0], 200)
+            chunks.append((key, data))
+            off += len(data)
+            entries += (off.to_bytes(8, "little") if ext == ".didx" else b"") + bytes.fromhex(h)
+        idx = b"\0" * 4096 + entries
+        st = self.pbs.request("PUT", f".cnt/vm/{name}/2026-11-04T10:00:00Z/drive-scsi0.img{ext}", body=idx,
+                              headers={"content-type": "application/octet-stream"})[0]
+        self.assertEqual(st, 200)
+        return chunks
+
+    def test_readahead_speeds_up_sequential_restore(self):
+        chunks = self._snapshot("901", 48)
+        self.assertTrue(self.store.index.has_chunk_lists(STORE))
+        ra = self.store.readahead
+        ra.summary()  # reset counters
+        self.mstate.latency = 0.2  # every Drime API call (incl. the download redirect) takes 200 ms
+        try:
+            t0 = time.monotonic()
+            for k, v in chunks:  # one at a time, like a PBS restore
+                st, _, got = self.pbs.request("GET", k)
+                self.assertEqual((st, got), (200, v), k)
+            dt = time.monotonic() - t0
+        finally:
+            self.mstate.latency = 0.0
+        s = ra.summary()
+        print(f"\n  sequential read of 48 chunks at 200 ms/call: {dt:.1f} s; {s}")
+        self.assertLess(dt, 48 * 0.2 / 3, "read-ahead did not parallelize the restore")
+        hits = int(s.split("hits ")[1].split()[0])
+        self.assertGreaterEqual(hits, 40)
+
+    def test_readahead_fixed_index_and_wrong_order(self):
+        chunks = self._snapshot("902", 40, ext=".fidx")
+        random.seed(7)
+        order = chunks[:]
+        random.shuffle(order)  # not the index order: read-ahead must stay correct and back off
+        for k, v in order:
+            self.assertEqual(self.pbs.request("GET", k)[2], v, k)
+        # deleting a chunk must not leave it servable from the read-ahead cache
+        k0, _ = chunks[1]
+        self.assertEqual(self.pbs.request("DELETE", k0)[0], 204)
+        self.assertEqual(self.pbs.request("GET", k0)[0], 404)
 
     def test_zz_rebuild_index(self):
         # runs last (alphabetical): everything uploaded so far must survive an index rebuild

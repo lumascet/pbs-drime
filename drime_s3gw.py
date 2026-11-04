@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -81,6 +81,9 @@ class Config:
     max_object_size: int = 256 * MiB
     prefill_chunk_folders: bool = True
     verify_uploads: bool = True  # read one byte back after each upload; re-upload if missing
+    readahead: bool = True  # prefetch the following chunks of a snapshot during restores
+    readahead_window: int = 24  # chunks fetched ahead (in parallel) per restore stream
+    readahead_cache_mib: int = 256  # RAM for prefetched chunks
     log_level: str = "INFO"
 
     @classmethod
@@ -495,6 +498,9 @@ CREATE TABLE IF NOT EXISTS objects (
     key TEXT PRIMARY KEY, size INTEGER NOT NULL, etag TEXT NOT NULL, mtime REAL NOT NULL,
     entry_id INTEGER NOT NULL, url TEXT, hash TEXT) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY, id INTEGER NOT NULL) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS chunk_lists (
+    key TEXT PRIMARY KEY, store TEXT NOT NULL, mtime REAL NOT NULL, digests BLOB NOT NULL) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS chunk_lists_store ON chunk_lists (store, mtime);
 """
 
 
@@ -555,7 +561,29 @@ class Index:
                           (path, path + "/", path + "/" + TOP))
 
     def clear(self) -> None:
-        self._c().executescript("DELETE FROM objects; DELETE FROM folders;")
+        self._c().executescript("DELETE FROM objects; DELETE FROM folders; DELETE FROM chunk_lists;")
+
+    # -- chunk lists of PBS index files (drive read-ahead)
+    def put_chunk_list(self, key: str, store: str, digests: bytes) -> None:
+        self._c().execute("INSERT OR REPLACE INTO chunk_lists VALUES (?,?,?,?)",
+                          (key, store, time.time(), digests))
+
+    def delete_chunk_list(self, key: str) -> None:
+        self._c().execute("DELETE FROM chunk_lists WHERE key=?", (key,))
+
+    def has_chunk_lists(self, store: str) -> bool:
+        return self._c().execute("SELECT 1 FROM chunk_lists WHERE store=? LIMIT 1", (store,)).fetchone() is not None
+
+    def find_in_chunk_lists(self, store: str, digest: bytes):
+        """Newest chunk list containing digest -> (key, digests, position) or None."""
+        for key, blob in self._c().execute(
+                "SELECT key, digests FROM chunk_lists WHERE store=? ORDER BY mtime DESC", (store,)):
+            i = blob.find(digest)
+            while i >= 0:
+                if i % 32 == 0:
+                    return key, blob, i // 32
+                i = blob.find(digest, i + 1)
+        return None
 
 
 # --------------------------------------------------------------------------- key <-> drime layout
@@ -600,6 +628,222 @@ def _is_md5_etag(etag: str) -> bool:
     return bool(re.fullmatch(r'"[0-9a-f]{32}"', etag))
 
 
+CHUNK_KEY = re.compile(r"([^/]+)/\.chunks/[0-9a-f]{4}/([0-9a-f]{64})")
+
+
+def parse_chunk_list(key: str, data: bytes) -> tuple[str, bytes] | None:
+    """For a PBS index file (`<store>/.cnt/.../*.didx|*.fidx`) return (store, concatenated
+    32-byte chunk digests in order), else None. Index files are not encrypted, even for
+    encrypted backups: they hold digests of the (encrypted) chunks."""
+    store, sep, rest = key.partition("/")
+    if not sep or not rest.startswith(".cnt/"):
+        return None
+    if key.endswith(".didx"):
+        step, off = 40, 8  # u64 end offset + digest
+    elif key.endswith(".fidx"):
+        step, off = 32, 0
+    else:
+        return None
+    if len(data) < 4096 or (len(data) - 4096) % step:
+        return None
+    if step == 32:
+        return store, bytes(data[4096:])
+    return store, b"".join(data[i + off:i + step] for i in range(4096, len(data), step))
+
+
+class _Stream:
+    """One restore being followed: a chunk list and the position we expect next."""
+    __slots__ = ("store", "key", "blob", "pos", "hits", "waste", "dead")
+
+    def __init__(self, store: str, key: str, blob: bytes, pos: int):
+        self.store, self.key, self.blob, self.pos = store, key, blob, pos
+        self.hits = self.waste = 0
+        self.dead = False
+
+    def __len__(self):
+        return len(self.blob) // 32
+
+    def digest(self, i: int) -> str:
+        return self.blob[i * 32:(i + 1) * 32].hex()
+
+
+class ReadAhead:
+    """Prefetch the chunks that follow a requested chunk in a snapshot's chunk list.
+
+    PBS restores fetch chunks strictly one at a time, so a restore runs at
+    chunk-size / per-request latency (~10 MiB/s against Drime). The gateway stores every
+    index file PBS writes, so it knows the order: on a request it locates the chunk in the
+    newest chunk list containing it and fetches the next `window` chunks in parallel into a
+    bounded RAM cache. Streams whose prefetched chunks go unused are stopped.
+    """
+
+    MAX_STREAMS = 8
+
+    def __init__(self, store: "Store", window: int, cache_mib: int):
+        from collections import OrderedDict
+        from concurrent.futures import ThreadPoolExecutor
+        self.store = store
+        self.window = max(1, window)
+        self.cap = max(1, cache_mib) * MiB
+        self.lock = threading.Lock()
+        self.cache: "OrderedDict[str, list]" = OrderedDict()  # key -> [data, hits, stream]
+        self.bytes = 0
+        self.pending: dict[str, threading.Event] = {}
+        self.streams: list[_Stream] = []
+        self.pool = ThreadPoolExecutor(self.window, thread_name_prefix="readahead")
+        self.backfilled: set[str] = set()
+        self.stats = {"hits": 0, "misses": 0, "prefetched": 0, "wasted": 0}
+
+    # -- request path
+    def fetch(self, key: str, loader) -> bytes:
+        m = CHUNK_KEY.fullmatch(key)
+        if not m:
+            return loader()
+        store, digest = m.group(1), m.group(2)
+        with self.lock:
+            ent = self.cache.get(key)
+            ev = self.pending.get(key) if ent is None else None
+        if ev is not None:
+            ev.wait(300)
+            with self.lock:
+                ent = self.cache.get(key)
+        if ent is not None:
+            with self.lock:
+                ent[1] += 1
+                if key in self.cache:  # served: evict before chunks that are still ahead
+                    self.cache.move_to_end(key, last=False)
+                st = ent[2]
+                if st is not None:
+                    st.hits += 1
+                self.stats["hits"] += 1
+            if st is not None and not st.dead:
+                self._advance(st, digest)
+            return ent[0]
+        with self.lock:
+            self.stats["misses"] += 1
+        data = loader()
+        try:
+            self._locate(store, digest)
+        except Exception as e:  # noqa: BLE001 - read-ahead is best effort
+            log.warning("read-ahead lookup failed: %s", e)
+        return data
+
+    def summary(self) -> str:
+        with self.lock:
+            s = dict(self.stats)
+            for k in self.stats:
+                self.stats[k] = 0
+            live = sum(1 for st in self.streams if not st.dead)
+            cached = self.bytes
+        if not any(s.values()):
+            return ""
+        return (f"read-ahead: hits {s['hits']} misses {s['misses']} prefetched {s['prefetched']} "
+                f"wasted {s['wasted']} streams {live} cache {cached / MiB:.0f} MiB")
+
+    def discard(self, keys) -> None:
+        with self.lock:
+            for k in keys:
+                ent = self.cache.pop(k, None)
+                if ent is not None:
+                    self.bytes -= len(ent[0])
+
+    # -- stream tracking
+    def _advance(self, st: _Stream, digest: str) -> None:
+        lo, hi = max(0, st.pos - 1), min(len(st), st.pos + 2 * self.window)
+        for j in range(lo, hi):
+            if st.digest(j) == digest:
+                st.pos = j + 1
+                break
+        self._schedule(st)
+
+    def _locate(self, store: str, digest: str) -> None:
+        with self.lock:
+            streams = [s for s in self.streams if not s.dead and s.store == store]
+        for st in streams:  # an existing restore that skipped ahead or was evicted
+            for j in range(st.pos, min(len(st), st.pos + 4 * self.window)):
+                if st.digest(j) == digest:
+                    st.pos = j + 1
+                    self._schedule(st)
+                    return
+        self._ensure_lists(store)
+        hit = self.store.index.find_in_chunk_lists(store, bytes.fromhex(digest))
+        if hit is None:
+            return
+        key, blob, pos = hit
+        st = _Stream(store, key, blob, pos + 1)
+        with self.lock:
+            self.streams.append(st)
+            if len(self.streams) > self.MAX_STREAMS:
+                self.streams.pop(0).dead = True
+        log.debug("read-ahead following %s from chunk %d", key, pos)
+        self._schedule(st)
+
+    def _schedule(self, st: _Stream) -> None:
+        start = []
+        with self.lock:
+            for j in range(st.pos, min(len(st), st.pos + self.window)):
+                if len(self.pending) >= 2 * self.window:
+                    break
+                d = st.digest(j)
+                k = f"{st.store}/.chunks/{d[:4]}/{d}"
+                if k in self.cache or k in self.pending:
+                    continue
+                self.pending[k] = threading.Event()
+                start.append(k)
+        for k in start:
+            self.pool.submit(self._prefetch, k, st)
+
+    def _prefetch(self, key: str, st: _Stream) -> None:
+        data = None
+        try:
+            if not st.dead and self.store.index.get(key) is not None:
+                data = self.store.download_key(key)
+        except Exception as e:  # noqa: BLE001 - the real request will fetch it itself
+            log.debug("prefetch of %s failed: %s", key, e)
+        with self.lock:
+            if data is not None:
+                self.cache[key] = [data, 0, st]
+                self.bytes += len(data)
+                self.stats["prefetched"] += 1
+                while self.bytes > self.cap and self.cache:
+                    _, (d, hits, s) = self.cache.popitem(last=False)
+                    self.bytes -= len(d)
+                    if hits == 0:
+                        self.stats["wasted"] += 1
+                        if s is not None:
+                            s.waste += 1
+                            if not s.dead and s.waste >= self.window and s.waste > s.hits:
+                                s.dead = True
+                                log.info("read-ahead for %s stopped: prefetched chunks went unused", s.key)
+            self.pending.pop(key).set()
+
+    def _ensure_lists(self, store: str) -> None:
+        """Chunk lists are recorded when PBS writes index files. For index files written
+        before this feature (or after rebuild-index), load them once in the background."""
+        with self.lock:
+            if store in self.backfilled:
+                return
+            self.backfilled.add(store)
+        if self.store.index.has_chunk_lists(store):
+            return
+
+        def run():
+            n = 0
+            for o in self.store.index.list_after(store + "/.cnt/", "", 10 ** 9):
+                if o.key.endswith((".didx", ".fidx")):
+                    try:
+                        parsed = parse_chunk_list(o.key, self.store.download_key(o.key))
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("could not load chunk list %s: %s", o.key, e)
+                        continue
+                    if parsed:
+                        self.store.index.put_chunk_list(o.key, parsed[0], parsed[1])
+                        n += 1
+            log.info("read-ahead: loaded %d chunk lists for datastore %s", n, store)
+
+        threading.Thread(target=run, name="readahead-backfill", daemon=True).start()
+
+
 # --------------------------------------------------------------------------- store
 
 
@@ -617,6 +861,8 @@ class Store:
         self._prefill_started: set[tuple[str, ...]] = set()
         self.key_locks = [threading.Lock() for _ in range(512)]
         self.inflight = threading.BoundedSemaphore(max(1, cfg.max_inflight))
+        self.readahead = ReadAhead(self, cfg.readahead_window, cfg.readahead_cache_mib) \
+            if cfg.readahead else None
 
     def _key_lock(self, key: str) -> threading.Lock:
         return self.key_locks[int.from_bytes(hashlib.blake2s(key.encode(), digest_size=4).digest()) % 512]
@@ -816,12 +1062,25 @@ class Store:
                     self.drime.rename(obj.entry_id, dname)
                 except DrimeError as e:
                     log.warning("Drime stored %s as %r and rename failed: %s", key, item.get("name"), e)
+        parsed = parse_chunk_list(key, data)
+        if parsed:
+            self.index.put_chunk_list(key, parsed[0], parsed[1])
         return obj
 
     def get(self, key: str) -> tuple[Obj, bytes]:
         o = self.head(key)
         if o.size == 0:
             return o, b""
+        if self.readahead is not None:
+            return o, self.readahead.fetch(key, lambda: self._download(o))
+        return o, self._download(o)
+
+    def download_key(self, key: str) -> bytes:
+        o = self.head(key)
+        return b"" if o.size == 0 else self._download(o)
+
+    def _download(self, o: Obj) -> bytes:
+        key = o.key
         problem = ""
         with self.inflight:
             for _ in range(3):
@@ -839,13 +1098,15 @@ class Store:
                 elif _is_md5_etag(o.etag) and f'"{hashlib.md5(data).hexdigest()}"' != o.etag:
                     problem = "MD5 mismatch"
                 else:
-                    return o, data
+                    return data
                 log.warning("download of %s from Drime: %s, retrying", key, problem)
         raise S3Error(500, "InternalError", f"download of {key} failed integrity check: {problem}")
 
     def _forget_lost(self, o: Obj) -> None:
         with self._key_lock(o.key):
             self.index.delete_if(o.key, o.entry_id)
+        if self.readahead is not None:
+            self.readahead.discard([o.key])
         try:
             self.drime.delete([o.entry_id], True)
         except DrimeError as e:
@@ -886,6 +1147,10 @@ class Store:
         for o in objs:
             with self._key_lock(o.key):
                 self.index.delete_if(o.key, o.entry_id)
+            if o.key.endswith((".didx", ".fidx")):
+                self.index.delete_chunk_list(o.key)
+        if self.readahead is not None:
+            self.readahead.discard([o.key for o in objs])
 
     def copy(self, src: str, dst: str) -> Obj:
         _, data = self.get(src)
@@ -1062,6 +1327,7 @@ class Stats:
         self.interval = interval
         self.lock = threading.Lock()
         self.inflight = 0
+        self.extra = None  # optional callable returning an extra summary string
         self._reset()
         threading.Thread(target=self._loop, name="stats", daemon=True).start()
 
@@ -1097,6 +1363,9 @@ class Stats:
                              self.bytes_in / MiB / self.interval, self.bytes_out / MiB / self.interval,
                              self.inflight, self.peak, 1000 * self.latency / n)
                 self._reset()
+            extra = self.extra() if self.extra else ""
+            if extra:
+                log.info("stats %ds: %s", self.interval, extra)
 
 
 def _x(s) -> str:
@@ -1453,8 +1722,11 @@ class Server(http.server.ThreadingHTTPServer):
 
 
 def make_server(cfg: Config, store: Store) -> Server:
+    stats = Stats()
+    if store.readahead is not None:
+        stats.extra = store.readahead.summary
     handler = type("BoundHandler", (Handler,), {"store": store, "auth": SigV4(cfg), "cfg": cfg,
-                                                "stats": Stats()})
+                                                "stats": stats})
     ctx = None
     if cfg.tls:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
