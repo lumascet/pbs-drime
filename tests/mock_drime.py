@@ -15,6 +15,7 @@ import json
 import random
 import re
 import threading
+import time
 import urllib.parse
 import uuid
 
@@ -28,6 +29,7 @@ class State:
         self.entries: dict[int, dict] = {}
         self.uploads: dict[str, dict] = {}
         self.fail_rate = 0.0
+        self.latency = 0.0  # seconds added to every API call (not to storage PUT/GET)
         self.calls: dict[str, int] = {}
         self.auth_leaks = 0
         self.alt_host = ""  # host:port used for download redirects
@@ -119,6 +121,8 @@ def make_handler(state: State):
                 return self._storage(method, path, body)
             if self.headers.get("Authorization") != f"Bearer {TOKEN}":
                 return self._json(401, {"message": "Unauthenticated."})
+            if state.latency:
+                time.sleep(state.latency)
             r = random.random()
             if r < state.fail_rate / 3:
                 return self._json(429, {"message": "Too Many Attempts."}, {"Retry-After": "0"})

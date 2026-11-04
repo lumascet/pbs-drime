@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -48,6 +48,7 @@ SMALL_UPLOAD_MAX = 5 * MiB  # <= this: POST /uploads; above: S3 multipart flow
 PART_SIZE = 5 * MiB  # multipart part size used by Drime's own clients
 RETRY_STATUS = {429, 500, 502, 503, 504, 509, 520, 521, 522, 523, 524}
 HEX4 = re.compile(r"[0-9a-f]{4}")
+HEX3 = re.compile(r"[0-9a-f]{3}")
 HEX2 = re.compile(r"[0-9a-f]{2}")
 LIST_PAGE = 1000
 TOP = "\U0010ffff"  # sorts after every other code point
@@ -73,11 +74,12 @@ class Config:
     workspace_id: int = 0
     index_db: str = "/var/lib/drime-s3gw/index.sqlite"
     hard_delete: bool = True
-    requests_per_minute: int = 1500
-    max_inflight: int = 16
+    requests_per_minute: int = 1800
+    max_inflight: int = 64
     retries: int = 6
     http_timeout: float = 300.0
     max_object_size: int = 256 * MiB
+    prefill_chunk_folders: bool = True
     log_level: str = "INFO"
 
     @classmethod
@@ -537,9 +539,11 @@ class Index:
 def key_to_location(key: str) -> tuple[tuple[str, ...], str]:
     """Map an S3 key to (folder path, file name) on Drime.
 
-    PBS chunk keys `<store>/.chunks/<4hex>/<digest>` are stored as
-    `<store>/.chunks/<2hex>/<2hex>/<digest>` so no Drime folder ever needs to list more
-    than 256 sub-folders (Drime caps folder listings at ~20k entries).
+    PBS chunk keys `<store>/.chunks/<4hex>/<digest...>` are stored as
+    `<store>/.chunks/<3hex>/<digest...>`: 4096 folders instead of 65536, so folder
+    creation stops being a per-chunk cost after the first few thousand chunks, while
+    each folder stays far below Drime's ~20k-entry listing cap (~80M chunks total).
+    The 4-hex prefix is recovered from the file name, which starts with it.
     """
     parts = key.split("/")
     for p in parts:
@@ -549,8 +553,9 @@ def key_to_location(key: str) -> tuple[tuple[str, ...], str]:
     if parts[-1].endswith(EMPTY_SUFFIX):
         raise S3Error(400, "InvalidArgument", f"object keys must not end in {EMPTY_SUFFIX}")
     folders, name = parts[:-1], parts[-1]
-    if len(parts) >= 3 and parts[-3] == ".chunks" and HEX4.fullmatch(parts[-2]):
-        folders = parts[:-2] + [parts[-2][:2], parts[-2][2:]]
+    if len(parts) >= 3 and parts[-3] == ".chunks" and HEX4.fullmatch(parts[-2]) \
+            and name.startswith(parts[-2]):
+        folders = parts[:-2] + [parts[-2][:3]]
     if location_to_key(folders, name) != key:
         raise S3Error(400, "InvalidArgument", f"object key {key!r} collides with the chunk layout")
     return tuple(folders), name
@@ -558,8 +563,11 @@ def key_to_location(key: str) -> tuple[tuple[str, ...], str]:
 
 def location_to_key(folders, name: str) -> str:
     f = list(folders)
-    if len(f) >= 3 and f[-3] == ".chunks" and HEX2.fullmatch(f[-2]) and HEX2.fullmatch(f[-1]):
-        f = f[:-2] + [f[-2] + f[-1]]
+    if len(f) >= 2 and f[-2] == ".chunks" and HEX3.fullmatch(f[-1]) and name.startswith(f[-1]) \
+            and HEX4.match(name):
+        f = f[:-1] + [name[:4]]  # current layout: .chunks/abc/abcd...
+    elif len(f) >= 3 and f[-3] == ".chunks" and HEX2.fullmatch(f[-2]) and HEX2.fullmatch(f[-1]):
+        f = f[:-2] + [f[-2] + f[-1]]  # layout of 0.1.0: .chunks/ab/cd/abcd...
     return "/".join(f + [name])
 
 
@@ -576,8 +584,12 @@ class Store:
         self.root_parts = tuple(p for p in cfg.drime_root.split("/") if p)
         if not self.root_parts:
             raise SystemExit("drime_root must name a folder, e.g. 'pbs-s3'")
-        self.folder_lock = threading.RLock()
-        self.fresh: set[int] = set()  # folders created by this process (known to start empty)
+        # Folders whose sub-folders are all known to the index (created by us, or listed
+        # once). None stands for the Drime root.
+        self.complete: set[int | None] = set()
+        self._locks_guard = threading.Lock()
+        self._path_locks: dict[str, threading.Lock] = {}
+        self._prefill_started: set[tuple[str, ...]] = set()
         self.key_locks = [threading.Lock() for _ in range(512)]
         self.inflight = threading.BoundedSemaphore(max(1, cfg.max_inflight))
 
@@ -588,26 +600,77 @@ class Store:
     def folder_id(self, rel) -> int:
         return self._folder(self.root_parts + tuple(rel))
 
+    def _path_lock(self, path: str) -> threading.Lock:
+        with self._locks_guard:
+            lock = self._path_locks.get(path)
+            if lock is None:
+                lock = self._path_locks[path] = threading.Lock()
+            return lock
+
     def _folder(self, full: tuple[str, ...]) -> int:
+        """Resolve (creating if needed) a folder. Different folders resolve in parallel;
+        only threads needing the *same* missing folder wait for each other."""
         path = "/".join(full)
         fid = self.index.get_folder(path)
         if fid is not None:
             return fid
-        with self.folder_lock:
+        parent = self._folder(full[:-1]) if len(full) > 1 else None
+        with self._path_lock(path):
             fid = self.index.get_folder(path)
             if fid is not None:
                 return fid
-            parent = self._folder(full[:-1]) if len(full) > 1 else None
-            name = full[-1]
-            if parent is None or parent not in self.fresh:
-                hit = self.drime.find_folder(parent, name)
-                if hit:
-                    fid = int(hit["id"])
+            if parent not in self.complete:
+                self._scan(parent, full[:-1])
+                fid = self.index.get_folder(path)
             if fid is None:
-                fid = self._create_folder(parent, name)
-                self.fresh.add(fid)
-            self.index.set_folder(path, fid)
+                fid = self._create_folder(parent, full[-1])
+                self.index.set_folder(path, fid)
+                self.complete.add(fid)  # brand new: no sub-folders
             return fid
+
+    def _scan(self, parent: int | None, parent_full: tuple[str, ...]) -> None:
+        """List a parent's sub-folders once and remember them all."""
+        with self._path_lock("\0scan\0" + "/".join(parent_full)):
+            if parent in self.complete:
+                return
+            for item in self.drime.list_children(parent, folders_only=True):
+                p = "/".join(parent_full + (item.get("name") or "",))
+                if self.index.get_folder(p) is None:
+                    self.index.set_folder(p, int(item["id"]))
+            self.complete.add(parent)
+
+    def prefill_chunk_folders(self, chunks_rel: tuple[str, ...], workers: int = 4) -> int:
+        """Create all 4096 `.chunks/<3hex>` folders so no chunk upload has to wait for a
+        folder creation. Returns the number of folders created."""
+        from concurrent.futures import ThreadPoolExecutor
+        full = self.root_parts + tuple(chunks_rel)
+        self._folder(full)
+        self._scan(self.index.get_folder("/".join(full)), full)
+        missing = [full + (f"{i:03x}",) for i in range(4096)
+                   if self.index.get_folder("/".join(full + (f"{i:03x}",))) is None]
+        if missing:
+            log.info("creating %d chunk folders under %s", len(missing), "/".join(full))
+            with ThreadPoolExecutor(max(1, workers)) as ex:
+                list(ex.map(self._folder, missing))
+            log.info("chunk folders under %s complete", "/".join(full))
+        return len(missing)
+
+    def _maybe_prefill(self, folders: tuple[str, ...]) -> None:
+        if not self.cfg.prefill_chunk_folders or len(folders) < 2 or folders[-2] != ".chunks" or not HEX3.fullmatch(folders[-1]):
+            return
+        chunks_rel = folders[:-1]
+        with self._locks_guard:
+            if chunks_rel in self._prefill_started:
+                return
+            self._prefill_started.add(chunks_rel)
+
+        def run():
+            try:
+                self.prefill_chunk_folders(chunks_rel)
+            except Exception as e:  # noqa: BLE001 - folders are still created on demand
+                log.warning("background chunk-folder prefill for %s stopped: %s", "/".join(chunks_rel), e)
+
+        threading.Thread(target=run, name="prefill", daemon=True).start()
 
     def _create_folder(self, parent, name) -> int:
         attempt = 0
@@ -674,6 +737,7 @@ class Store:
 
     def put(self, key: str, data: bytes, if_none_match: bool = False) -> Obj:
         folders, name = key_to_location(key)
+        self._maybe_prefill(folders)
         etag = f'"{hashlib.md5(data).hexdigest()}"'
         with self._key_lock(key):
             old = self.index.get(key)
@@ -1344,6 +1408,14 @@ def cmd_selftest(cfg: Config, args) -> int:
     return 0 if ok else 1
 
 
+def cmd_prefill(cfg: Config, args) -> int:
+    store = _build(cfg)
+    t0 = time.monotonic()
+    n = store.prefill_chunk_folders((args.store, ".chunks"), workers=args.workers)
+    print(f"created {n} chunk folders for datastore {args.store!r} in {time.monotonic() - t0:.0f}s")
+    return 0
+
+
 def cmd_rebuild(cfg: Config, args) -> int:
     if not args.yes:
         print("This replaces the local index with a full walk of the Drime folder tree.\n"
@@ -1368,12 +1440,15 @@ def main(argv=None) -> int:
     sub.add_parser("selftest", help="round-trip test objects through Drime")
     rb = sub.add_parser("rebuild-index", help="recreate the local index from Drime")
     rb.add_argument("--yes", action="store_true")
+    pf = sub.add_parser("prefill", help="create all 4096 chunk folders of a datastore up front")
+    pf.add_argument("store", help="PBS datastore name (the key prefix)")
+    pf.add_argument("--workers", type=int, default=8)
     args = ap.parse_args(argv)
     cfg = Config.load(args.config)
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s")
     cmd = {"serve": cmd_serve, "check": cmd_check, "selftest": cmd_selftest,
-           "rebuild-index": cmd_rebuild}[args.cmd or "serve"]
+           "rebuild-index": cmd_rebuild, "prefill": cmd_prefill}[args.cmd or "serve"]
     return cmd(cfg, args)
 
 

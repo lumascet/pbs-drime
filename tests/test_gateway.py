@@ -120,7 +120,8 @@ class GatewayTest(unittest.TestCase):
                             region=REGION, listen="127.0.0.1", port=0, tls=True, cert=cert, key=key,
                             drime_api=f"http://127.0.0.1:{cls.msrv.server_address[1]}/api/v1",
                             drime_root="backups/pbs-s3", index_db=os.path.join(cls.tmp, "index.sqlite"),
-                            requests_per_minute=10 ** 6, retries=8, log_level="WARNING")
+                            requests_per_minute=10 ** 6, retries=8, log_level="WARNING",
+                            prefill_chunk_folders=False)
         gw.Drime.backoff = lambda self, attempt, retry_after=None: time.sleep(0.001)
         cls.store = gw.Store(cls.cfg, gw.Drime(cls.cfg), gw.Index(cls.cfg.index_db))
         cls.srv = gw.make_server(cls.cfg, cls.store)
@@ -170,9 +171,14 @@ class GatewayTest(unittest.TestCase):
             self.assertIn(name, h)
         self.assertEqual(len(h["last-modified"]), 29)
 
-        # Drime layout uses 2-level hex folders
+        # Drime layout: 4096 folders named by the first 3 hex digits
         folders, name = gw.key_to_location(f"{STORE}/{key}")
-        self.assertEqual(folders, (STORE, ".chunks", digest[:2], digest[2:4]))
+        self.assertEqual(folders, (STORE, ".chunks", digest[:3]))
+        self.assertEqual(gw.location_to_key(folders, name), f"{STORE}/{key}")
+        self.assertEqual(gw.location_to_key(folders, name + ".0.bad"), f"{STORE}/{key}.0.bad")
+        # objects written by 0.1.0 (.chunks/ab/cd/) still map back to their keys
+        self.assertEqual(gw.location_to_key((STORE, ".chunks", digest[:2], digest[2:4]), digest),
+                         f"{STORE}/{key}")
 
         st, _, xml = self.pbs.request("GET", "", query=[("list-type", "2"), ("prefix", f"{STORE}/.chunks/")])
         self.assertEqual(st, 200)
@@ -300,8 +306,8 @@ class GatewayTest(unittest.TestCase):
     # ------------------------------------------------------------------ resilience
     def test_fault_injection(self):
         self.mstate.fail_rate = 0.25
-        payloads = {f"faulty/.chunks/{i:04x}/{hashlib.sha256(str(i).encode()).hexdigest()}": os.urandom(50_000 + i)
-                    for i in range(60)}
+        digests = [hashlib.sha256(str(i).encode()).hexdigest() for i in range(60)]
+        payloads = {f"faulty/.chunks/{h[:4]}/{h}": os.urandom(50_000 + i) for i, h in enumerate(digests)}
         payloads["faulty/large"] = os.urandom(11 * MiB)
         for k, v in payloads.items():
             st, _, _ = self.pbs.request("PUT", k, body=v, headers={"content-type": "application/octet-stream",
@@ -327,8 +333,8 @@ class GatewayTest(unittest.TestCase):
         same = os.urandom(100_000)
         d = hashlib.sha256(same).hexdigest()
         same_key = f"conc/.chunks/{d[:4]}/{d}"
-        distinct = {f"conc/.chunks/{i:02x}{i:02x}/{hashlib.sha256(bytes([i])).hexdigest()}": os.urandom(20_000)
-                    for i in range(48)}
+        digests = [hashlib.sha256(bytes([i])).hexdigest() for i in range(48)]
+        distinct = {f"conc/.chunks/{h[:4]}/{h}": os.urandom(20_000) for h in digests}
 
         def put(kv):
             return PBSClient(self.port).request("PUT", kv[0], body=kv[1], headers=ct)[0]
@@ -346,6 +352,52 @@ class GatewayTest(unittest.TestCase):
             self.assertEqual(len(names), len(set(names)), f"duplicate folders under {fid}: {names}")
         for k, v in distinct.items():
             self.assertEqual(self.pbs.request("GET", k)[2], v)
+
+    def test_parallel_throughput(self):
+        """With 250 ms per Drime API call, 96 new chunks (each needing a new folder) from
+        32 parallel PBS uploads must finish far faster than serial processing would."""
+        from concurrent.futures import ThreadPoolExecutor
+        self.mstate.latency = 0.25
+        try:
+            ct = {"content-type": "application/octet-stream", "if-none-match": "*"}
+            digests = [hashlib.sha256(b"tp" + bytes([i])).hexdigest() for i in range(96)]
+            items = [(f"tp/.chunks/{h[:4]}/{h}", os.urandom(256 * 1024)) for h in digests]
+            local = threading.local()
+
+            def put(i):
+                if not hasattr(local, "c"):
+                    local.c = PBSClient(self.port)
+                k, v = items[i]
+                return local.c.request("PUT", k, body=v, headers=ct)[0]
+
+            t0 = time.monotonic()
+            with ThreadPoolExecutor(32) as ex:
+                results = list(ex.map(put, range(len(items))))
+            dt = time.monotonic() - t0
+        finally:
+            self.mstate.latency = 0.0
+        self.assertEqual(set(results), {200})
+        # serial would be >= 96 uploads * 2 calls (folder+upload) * 0.25 s = 48 s
+        print(f"\n  96 chunks with 250 ms API latency: {dt:.1f} s ({96 / dt:.1f} chunks/s)")
+        self.assertLess(dt, 12, "uploads are being serialized")
+
+    def test_prefill_chunk_folders(self):
+        """Prefill creates exactly 4096 chunk folders, races cleanly with uploads, and
+        is a no-op the second time."""
+        from concurrent.futures import ThreadPoolExecutor
+        digests = [hashlib.sha256(b"pf" + bytes([i])).hexdigest() for i in range(40)]
+        with ThreadPoolExecutor(9) as ex:
+            fut = ex.submit(self.store.prefill_chunk_folders, ("pf", ".chunks"), 8)
+            list(ex.map(lambda h: self.store.put(f"pf/.chunks/{h[:4]}/{h}", h.encode()), digests))
+            created = fut.result()
+        chunks_id = self.store.folder_id(("pf", ".chunks"))
+        names = [e["name"] for e in self.mstate.children(chunks_id) if e["type"] == "folder"]
+        self.assertEqual(len(names), 4096)
+        self.assertEqual(len(set(names)), 4096, "duplicate chunk folders")
+        self.assertLessEqual(created, 4096)
+        self.assertEqual(self.store.prefill_chunk_folders(("pf", ".chunks")), 0)
+        for h in digests:
+            self.assertEqual(self.store.get(f"pf/.chunks/{h[:4]}/{h}")[1], h.encode())
 
     def test_zz_rebuild_index(self):
         # runs last (alphabetical): everything uploaded so far must survive an index rebuild

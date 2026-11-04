@@ -88,7 +88,7 @@ proxmox-backup-manager s3 endpoint create drime \
   --endpoint 127.0.0.1 --port 8443 --path-style true --region us-west-1 \
   --access-key '<access_key>' --secret-key '<secret_key>' \
   --fingerprint '<AA:BB:...:FF from the openssl command above>' \
-  --limit-active-requests 15 --limit-passive-requests 10
+  --limit-active-requests 40 --limit-passive-requests 40
 
 proxmox-backup-manager datastore create drime /mnt/pbs-drime-cache \
   --backend type=s3,client=drime,bucket=pbs,max-cache-size=28GiB
@@ -97,9 +97,9 @@ proxmox-backup-manager datastore create drime /mnt/pbs-drime-cache \
 - `region` and `bucket` must match `config.toml`.
 - Use path-style addressing; virtual-host style is not supported.
 - Set `max-cache-size` a little below the dataset quota.
-- The request limits keep PBS under Drime's API budget, which is about 2000 requests per minute per
-  account. The gateway also throttles itself (`requests_per_minute`), so the limits mainly keep PBS
-  from queueing.
+- The request limits are a safety net. The gateway enforces Drime's API budget of about 2,000
+  requests per minute itself (`requests_per_minute`), so set the PBS limits high enough that PBS
+  keeps enough uploads in flight.
 
 Then add the datastore to PVE as usual (Datacenter → Storage → Add → Proxmox Backup Server), and
 schedule **verify**, **prune** and **GC** jobs on it.
@@ -108,12 +108,16 @@ schedule **verify**, **prune** and **GC** jobs on it.
 
 | S3 key (written by PBS) | Drime path under `drime_root` |
 |---|---|
-| `<store>/.chunks/abcd/<digest>` | `<store>/.chunks/ab/cd/<digest>` |
+| `<store>/.chunks/abcd/<digest>` | `<store>/.chunks/abc/<digest>` |
 | `<store>/.cnt/vm/100/2026-…Z/index.json.blob` | same path |
 | zero-byte object `…/.namespace` | `…/.namespace.s3gw-empty` (1 byte) |
 
-- **Chunk folders:** a Drime folder can't list more than about 20,000 entries. The chunk store is
-  therefore split two levels deep (256 × 256 folders) instead of PBS's 65,536 folders side by side.
+- **Chunk folders:** a Drime folder can't list more than about 20,000 entries, and creating a folder
+  costs an API call. Chunks therefore go into 4,096 folders named by the first three hex digits,
+  instead of PBS's 65,536. Folder creation stops after the first few thousand chunks, and each
+  folder stays far below the cap (about 80 million chunks in total). Folders are created in
+  parallel, and each parent folder is listed only once. Objects written by 0.1.0 in the old
+  `.chunks/ab/cd/` layout stay readable and `rebuild-index` still understands them.
 - **Index:** the gateway keeps a local SQLite index from each key to its Drime entry, with size,
   MD5/ETag and time. Listings, HEAD requests and `If-None-Match` checks never hit Drime. Only real
   uploads, downloads and deletes do.
@@ -160,7 +164,13 @@ drime-s3gw [-c CONFIG] serve             # default; the gateway
 drime-s3gw [-c CONFIG] check             # token, quota, root folder, index stats
 drime-s3gw [-c CONFIG] selftest          # round-trip test against your Drime account
 drime-s3gw [-c CONFIG] rebuild-index --yes
+drime-s3gw [-c CONFIG] prefill STORE      # create a datastore's 4096 chunk folders up front
 ```
+
+The gateway also starts the prefill on its own in the background when a datastore's first chunk
+arrives (`prefill_chunk_folders = true`). Until it finishes, an upload into a missing folder waits
+for one folder-creation call. Running `prefill <datastore>` before the first backup avoids that
+wait entirely.
 
 ## Limitations
 
@@ -172,8 +182,13 @@ drime-s3gw [-c CONFIG] rebuild-index --yes
   - Objects: Put/Get (with Range)/Head/Delete/CopyObject, and conditional `If-None-Match: *`.
 - **Not supported:** client multipart uploads, presigned URLs, versioning, ACLs, tagging and
   `aws-chunked` uploads.
-- **Throughput:** Drime's ~2000 API requests per minute limit throughput to roughly 60–100 MiB/s with
-  4 MiB chunks. A verify downloads every chunk a snapshot references.
+- **Throughput:** each chunk upload is one `POST /uploads`, which takes about 0.7–1.1 s, so
+  throughput comes from parallelism. In a measurement from a home connection, 16 parallel uploads
+  reached about 26 MiB/s (217 Mbit/s). `max_inflight` (default 48) sets the ceiling, together with
+  Drime's limit of about 2,000 API requests per minute.
+- **Downloads are slow:** Drime takes 5–10 s to answer each download request with a redirect to
+  storage, so verify and restore are limited by parallelism, not bandwidth. A verify downloads
+  every chunk a snapshot references.
 
 ## Development
 

@@ -31,8 +31,9 @@ workspace_id = 0                 # 0 = personal space
 index_db = "/var/lib/drime-s3gw/index.sqlite"
 
 hard_delete = true               # GC'd chunks skip the Drime trash
-requests_per_minute = 1500       # Drime allows ~2000 API requests/min per account
-max_inflight = 16                # concurrent Drime uploads/downloads
+requests_per_minute = 1800       # Drime allows ~2000 API requests/min per account
+max_inflight = 64               # concurrent Drime uploads/downloads; throughput is
+                                 # roughly max_inflight * 4 MiB / Drime upload latency
 retries = 6
 http_timeout = 300
 max_object_size = 268435456      # 256 MiB; PBS objects are normally <= 16 MiB
