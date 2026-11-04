@@ -72,14 +72,38 @@ journalctl -u drime-s3gw -f
 
 PBS requires a local cache directory for every S3 datastore. It holds the index files, one marker
 file per chunk, and an LRU cache of chunk data. It is **not** a full copy of the datastore. Proxmox
-recommends 64–128 GiB. Smaller works too, at the cost of more downloads during restores. A ZFS dataset
-with a quota keeps the cache from growing past its limit:
+recommends 64–128 GiB.
+
+**By default PBS writes every chunk it uploads into the cache as well, so the SSD gets a full copy of
+every backup's data written to it.** To avoid that, keep only the cache's `.chunks` directory in RAM
+(tmpfs) and limit `max-cache-size`. Index files and manifests stay on disk; they are small, roughly
+8 MB per TB of backups:
 
 ```bash
-zfs create -o quota=32G -o atime=on -o relatime=on -o mountpoint=/mnt/pbs-drime-cache rpool/pbs-drime-cache
+zfs create -o quota=8G -o atime=on -o relatime=on -o mountpoint=/mnt/pbs-drime-cache rpool/pbs-drime-cache
+install -m 755 contrib/pbs-chunk-cache-tmpfs /usr/local/sbin/
+install -m 644 'contrib/pbs-chunk-cache-tmpfs@.service' /etc/systemd/system/
+systemctl daemon-reload
+# after `datastore create` below (it creates .chunks):
+systemctl stop proxmox-backup-proxy proxmox-backup
+systemctl enable --now "pbs-chunk-cache-tmpfs@$(systemd-escape -p /mnt/pbs-drime-cache).service"
+systemctl start proxmox-backup proxmox-backup-proxy
 ```
 
-(`atime` must work, because PBS garbage collection checks it on the cache.)
+The unit mounts a 1 GiB tmpfs on `.chunks` and creates PBS's 65,536 prefix directories before PBS
+starts. With `max-cache-size=256MiB`, at most 16 chunks are cached, and markers for the rest are
+empty files.
+
+**Measured:** a 1 GiB backup wrote **228 KiB** to the SSD, compared with about 1 GiB with a disk cache.
+
+**After a reboot:** the tmpfs starts empty. Nothing breaks:
+- The next GC re-marks every chunk that a backup still references.
+- Re-uploads of chunks that already exist are answered from the gateway's index with `412`, without
+  a call to Drime.
+
+**If the unit fails,** PBS still starts and caches on disk again.
+
+(`atime` must work, because PBS garbage collection checks it on the cache; tmpfs supports it.)
 
 ### Endpoint and datastore
 
@@ -91,12 +115,18 @@ proxmox-backup-manager s3 endpoint create drime \
   --limit-active-requests 40 --limit-passive-requests 40
 
 proxmox-backup-manager datastore create drime /mnt/pbs-drime-cache \
-  --backend type=s3,client=drime,bucket=pbs,max-cache-size=28GiB
+  --backend type=s3,client=drime,bucket=pbs,max-cache-size=256MiB
+proxmox-backup-manager datastore update drime \
+  --tuning default-verification-readers=32,default-verification-workers=4
+drime-s3gw prefill drime     # create the 4096 chunk folders on Drime before the first backup
 ```
 
 - `region` and `bucket` must match `config.toml`.
 - Use path-style addressing; virtual-host style is not supported.
-- Set `max-cache-size` a little below the dataset quota.
+- Keep `max-cache-size` well below the tmpfs size. Without the tmpfs, set it a little below the
+  dataset quota.
+- **Verify readers:** 32 parallel readers is the maximum PBS allows. One measured verify read from
+  Drime at about 100 MiB/s with 32 readers.
 - The request limits are a safety net. The gateway enforces Drime's API budget of about 2,000
   requests per minute itself (`requests_per_minute`), so set the PBS limits high enough that PBS
   keeps enough uploads in flight.
@@ -126,6 +156,14 @@ schedule **verify**, **prune** and **GC** jobs on it.
   - **Downloads:** the gateway checks size and MD5 against the index and retries before anything
     reaches PBS. A silently truncated transfer is retried, not reported to PBS as a corrupt chunk.
   - **Verify:** on top of that, PBS checks every chunk's SHA-256 itself.
+- **Drime loses data:**
+  - **What happened:** in testing, Drime acknowledged about 1% of uploads during one backup, but
+    their data never reached its storage. The file entry existed, and storage answered 404.
+  - **Read-after-write check:** the gateway therefore reads one byte back after every upload
+    (`verify_uploads`, about 0.2 s and 1 API call) and re-uploads if storage has nothing.
+  - **Repair on read:** if an object is later found missing, during a PBS verify or a
+    `drime-s3gw scrub`, the gateway forgets it. The next backup that contains that chunk uploads it
+    again instead of getting `412`.
 - **Failure handling:**
   - Drime errors (429, 5xx) are retried with backoff.
   - When a failed upload might have been stored anyway, the gateway looks for it on Drime and checks
@@ -165,7 +203,11 @@ drime-s3gw [-c CONFIG] check             # token, quota, root folder, index stat
 drime-s3gw [-c CONFIG] selftest          # round-trip test against your Drime account
 drime-s3gw [-c CONFIG] rebuild-index --yes
 drime-s3gw [-c CONFIG] prefill STORE      # create a datastore's 4096 chunk folders up front
+drime-s3gw [-c CONFIG] scrub [--prefix P]  # check every object's data exists in Drime storage
 ```
+
+`scrub` makes one cheap ranged request per object; it checked about 800 objects in 25 s. It exits
+with status 1 if it finds lost objects, so it can run from a timer and alert you.
 
 The gateway also starts the prefill on its own in the background when a datastore's first chunk
 arrives (`prefill_chunk_folders = true`). Until it finishes, an upload into a missing folder waits
@@ -182,13 +224,13 @@ wait entirely.
   - Objects: Put/Get (with Range)/Head/Delete/CopyObject, and conditional `If-None-Match: *`.
 - **Not supported:** client multipart uploads, presigned URLs, versioning, ACLs, tagging and
   `aws-chunked` uploads.
-- **Throughput:** each chunk upload is one `POST /uploads`, which takes about 0.7–1.1 s, so
-  throughput comes from parallelism. In a measurement from a home connection, 16 parallel uploads
-  reached about 26 MiB/s (217 Mbit/s). `max_inflight` (default 48) sets the ceiling, together with
-  Drime's limit of about 2,000 API requests per minute.
-- **Downloads are slow:** Drime takes 5–10 s to answer each download request with a redirect to
-  storage, so verify and restore are limited by parallelism, not bandwidth. A verify downloads
-  every chunk a snapshot references.
+- **Throughput:** each chunk upload is one `POST /uploads`, which takes 0.7–5 s depending on load,
+  so throughput comes from parallelism (`max_inflight`, default 64).
+  - **Measured on a 250 Mbit/s uplink:** real PBS backups reached 26–30 MiB/s, about 220–250 Mbit/s,
+    with 64 uploads in flight. That is essentially the full line.
+  - **Verify:** with 32 readers, verify read at about 100 MiB/s.
+  - **Drime has slow periods:** at times its download redirect took 5–10 s instead of about 0.1 s,
+    and folder creation dropped to about 1 per second.
 
 ## Development
 

@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -80,6 +80,7 @@ class Config:
     http_timeout: float = 300.0
     max_object_size: int = 256 * MiB
     prefill_chunk_folders: bool = True
+    verify_uploads: bool = True  # read one byte back after each upload; re-upload if missing
     log_level: str = "INFO"
 
     @classmethod
@@ -185,7 +186,7 @@ class HTTP:
         if conn is not None:
             conn.close()
 
-    def request(self, method, url, body=None, headers=None, max_redirects=5):
+    def request(self, method, url, body=None, headers=None, max_redirects=5, follow=True):
         headers = dict(headers or {})
         for _ in range(max_redirects + 1):
             u = urllib.parse.urlsplit(url)
@@ -201,7 +202,7 @@ class HTTP:
             if resp.will_close:
                 self._drop(u.scheme, u.netloc)
             location = resp.getheader("Location")
-            if resp.status in (301, 302, 303, 307, 308) and location:
+            if follow and resp.status in (301, 302, 303, 307, 308) and location:
                 new = urllib.parse.urljoin(url, location)
                 if urllib.parse.urlsplit(new).netloc != u.netloc:
                     headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
@@ -423,6 +424,30 @@ class Drime:
                     continue
                 raise
         raise DrimeError(0, "unreachable")
+
+    def stored_size(self, item_url: str | None, item_hash: str | None) -> int | None:
+        """Ask the storage behind an entry for one byte. Returns the object's total size, or
+        None if the storage has no object (Drime sometimes acknowledges an upload whose data
+        never reaches storage)."""
+        if item_url:
+            url = item_url if "://" in item_url else self.site + item_url.lstrip("/")
+        elif item_hash:
+            url = f"{self.api}/file-entries/download/{item_hash}"
+        else:
+            raise DrimeError(0, "entry has neither url nor hash")
+        try:
+            status, rh, _ = self.call("GET", url=url, raw=True, headers={"Range": "bytes=0-0"})
+        except DrimeError as e:
+            if e.status == 404:
+                return None
+            raise
+        # call() follows the redirect to storage; 206 carries "bytes 0-0/<total>"
+        if status == 206:
+            total = (rh.get("content-range") or "").rpartition("/")[2]
+            return int(total) if total.isdigit() else None
+        if status == 200:
+            return int(rh.get("content-length") or 0)
+        return None
 
     def delete(self, ids: list[int], forever: bool) -> None:
         for i in range(0, len(ids), 100):
@@ -689,6 +714,38 @@ class Store:
 
     # -- uploads
     def _upload(self, folders, dname: str, payload: bytes, exclude: set[int]):
+        """Upload and, if enabled, confirm the data actually reached Drime's storage."""
+        lost = 0
+        while True:
+            item = self._upload_once(folders, dname, payload, exclude)
+            if not self.cfg.verify_uploads or self._landed(item, len(payload)):
+                if lost:
+                    log.info("%s stored correctly after %d re-upload(s)", dname, lost)
+                return item
+            lost += 1
+            log.warning("Drime acknowledged %s (entry %s) but storage has no data; re-uploading (%d)",
+                        dname, item.get("id"), lost)
+            try:
+                self.drime.delete([int(item["id"])], True)
+            except DrimeError as e:
+                log.warning("could not delete broken entry %s: %s", item.get("id"), e)
+            if lost > self.cfg.retries:
+                raise DrimeError(0, f"Drime kept losing the data of {dname}")
+            self.drime.backoff(lost)
+
+    def _landed(self, item, size: int) -> bool:
+        for attempt in (1, 2):  # second look in case storage is briefly behind the API
+            got = self.drime.stored_size(item.get("url"), item.get("hash"))
+            if got == size:
+                return True
+            if got is not None:
+                log.warning("storage size of entry %s is %s, expected %s", item.get("id"), got, size)
+                return False
+            if attempt == 1:
+                time.sleep(1.5)
+        return False
+
+    def _upload_once(self, folders, dname: str, payload: bytes, exclude: set[int]):
         md5 = hashlib.md5(payload).digest()
         attempt = 0
         stale_folder_retry = True
@@ -772,7 +829,9 @@ class Store:
                     data = self.drime.download(o.url, o.hash)
                 except DrimeError as e:
                     if e.status in (404, 410):
-                        log.error("Drime has no data for %s (entry %s)", key, o.entry_id)
+                        log.error("Drime has no data for %s (entry %s); forgetting it so the next "
+                                  "backup uploads it again", key, o.entry_id)
+                        self._forget_lost(o)
                         raise S3Error(404, "NoSuchKey", "object data missing on Drime") from e
                     raise
                 if len(data) != o.size:
@@ -783,6 +842,40 @@ class Store:
                     return o, data
                 log.warning("download of %s from Drime: %s, retrying", key, problem)
         raise S3Error(500, "InternalError", f"download of {key} failed integrity check: {problem}")
+
+    def _forget_lost(self, o: Obj) -> None:
+        with self._key_lock(o.key):
+            self.index.delete_if(o.key, o.entry_id)
+        try:
+            self.drime.delete([o.entry_id], True)
+        except DrimeError as e:
+            log.warning("could not delete broken entry %s: %s", o.entry_id, e)
+
+    def scrub(self, prefix: str = "", workers: int = 16) -> dict:
+        """Check that every indexed object's data exists in Drime's storage (one ranged GET
+        each); forget the lost ones so the next backup re-uploads them."""
+        from concurrent.futures import ThreadPoolExecutor
+        objs = [o for o in self.index.list_after(prefix, "", 10 ** 9) if o.size > 0]
+        stats = {"checked": 0, "lost": 0, "lost_keys": []}
+        lock = threading.Lock()
+
+        def check(o: Obj):
+            size = self.drime.stored_size(o.url, o.hash)
+            with lock:
+                stats["checked"] += 1
+                if stats["checked"] % 500 == 0:
+                    log.info("scrub: %d/%d checked, %d lost", stats["checked"], len(objs), stats["lost"])
+            if size != o.size:
+                log.error("scrub: %s (entry %s) has %s bytes in storage, expected %s",
+                          o.key, o.entry_id, size, o.size)
+                self._forget_lost(o)
+                with lock:
+                    stats["lost"] += 1
+                    stats["lost_keys"].append(o.key)
+
+        with ThreadPoolExecutor(max(1, workers)) as ex:
+            list(ex.map(check, objs))
+        return stats
 
     def delete(self, keys: list[str]) -> None:
         objs = [o for o in (self.index.get(k) for k in keys) if o is not None]
@@ -962,6 +1055,50 @@ class SigV4:
 # --------------------------------------------------------------------------- s3 http frontend
 
 
+class Stats:
+    """Per-interval request statistics, logged while there is traffic."""
+
+    def __init__(self, interval: float = 10.0):
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.inflight = 0
+        self._reset()
+        threading.Thread(target=self._loop, name="stats", daemon=True).start()
+
+    def _reset(self):
+        self.count: dict[str, int] = {}
+        self.bytes_in = self.bytes_out = 0
+        self.latency = 0.0
+        self.peak = self.inflight
+
+    def begin(self) -> None:
+        with self.lock:
+            self.inflight += 1
+            self.peak = max(self.peak, self.inflight)
+
+    def end(self, method: str, status, dt: float, bytes_in: int, bytes_out: int) -> None:
+        with self.lock:
+            self.inflight -= 1
+            k = f"{method}:{status}"
+            self.count[k] = self.count.get(k, 0) + 1
+            self.bytes_in += bytes_in
+            self.bytes_out += bytes_out
+            self.latency += dt
+
+    def _loop(self):
+        while True:
+            time.sleep(self.interval)
+            with self.lock:
+                n = sum(self.count.values())
+                if n:
+                    log.info("stats %ds: %s | in %.1f MiB/s out %.1f MiB/s | inflight now %d peak %d | "
+                             "avg latency %.0f ms", self.interval,
+                             " ".join(f"{k}={v}" for k, v in sorted(self.count.items())),
+                             self.bytes_in / MiB / self.interval, self.bytes_out / MiB / self.interval,
+                             self.inflight, self.peak, 1000 * self.latency / n)
+                self._reset()
+
+
 def _x(s) -> str:
     return _xml_escape(str(s))
 
@@ -991,6 +1128,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     store: Store
     auth: SigV4
     cfg: Config
+    stats: Stats
 
     def setup(self):
         if isinstance(self.request, ssl.SSLSocket):
@@ -1018,6 +1156,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # -- plumbing
     def _send(self, status: int, body: bytes = b"", headers: dict | None = None, ctype: str | None = None):
+        self._status = status
+        if self.command != "HEAD" and status not in (204, 304):
+            self._sent = len(body)
         self.send_response(status)
         self.send_header("x-amz-request-id", self._rid)
         hdrs = dict(headers or {})
@@ -1058,6 +1199,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str):
         self._rid = uuid.uuid4().hex[:16].upper()
+        self._sent = 0
+        self._status = "?"
+        t0 = time.monotonic()
+        self.stats.begin()
+        try:
+            self._dispatch_inner(method)
+        finally:
+            self.stats.end(method, getattr(self, "_status", "?"), time.monotonic() - t0,
+                           int(self.headers.get("Content-Length") or 0), self._sent)
+
+    def _dispatch_inner(self, method: str):
         t0 = time.monotonic()
         status = "?"
         try:
@@ -1301,7 +1453,8 @@ class Server(http.server.ThreadingHTTPServer):
 
 
 def make_server(cfg: Config, store: Store) -> Server:
-    handler = type("BoundHandler", (Handler,), {"store": store, "auth": SigV4(cfg), "cfg": cfg})
+    handler = type("BoundHandler", (Handler,), {"store": store, "auth": SigV4(cfg), "cfg": cfg,
+                                                "stats": Stats()})
     ctx = None
     if cfg.tls:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -1416,6 +1569,16 @@ def cmd_prefill(cfg: Config, args) -> int:
     return 0
 
 
+def cmd_scrub(cfg: Config, args) -> int:
+    store = _build(cfg)
+    t0 = time.monotonic()
+    st = store.scrub(args.prefix, args.workers)
+    print(f"scrub: {st['checked']} objects checked in {time.monotonic() - t0:.0f}s, {st['lost']} lost")
+    for k in st["lost_keys"]:
+        print(f"  lost (forgotten; re-uploaded by the next backup that needs it): {k}")
+    return 1 if st["lost"] else 0
+
+
 def cmd_rebuild(cfg: Config, args) -> int:
     if not args.yes:
         print("This replaces the local index with a full walk of the Drime folder tree.\n"
@@ -1443,12 +1606,16 @@ def main(argv=None) -> int:
     pf = sub.add_parser("prefill", help="create all 4096 chunk folders of a datastore up front")
     pf.add_argument("store", help="PBS datastore name (the key prefix)")
     pf.add_argument("--workers", type=int, default=8)
+    sc = sub.add_parser("scrub", help="check every object's data exists in Drime storage")
+    sc.add_argument("--prefix", default="", help="only keys starting with this, e.g. 'drime/'")
+    sc.add_argument("--workers", type=int, default=16)
     args = ap.parse_args(argv)
     cfg = Config.load(args.config)
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s")
     cmd = {"serve": cmd_serve, "check": cmd_check, "selftest": cmd_selftest,
-           "rebuild-index": cmd_rebuild, "prefill": cmd_prefill}[args.cmd or "serve"]
+           "rebuild-index": cmd_rebuild, "prefill": cmd_prefill,
+           "scrub": cmd_scrub}[args.cmd or "serve"]
     return cmd(cfg, args)
 
 

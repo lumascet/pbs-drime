@@ -30,6 +30,7 @@ class State:
         self.uploads: dict[str, dict] = {}
         self.fail_rate = 0.0
         self.latency = 0.0  # seconds added to every API call (not to storage PUT/GET)
+        self.lose_rate = 0.0  # fraction of acknowledged uploads whose data never reaches storage
         self.calls: dict[str, int] = {}
         self.auth_leaks = 0
         self.alt_host = ""  # host:port used for download redirects
@@ -56,14 +57,15 @@ class State:
         h = uuid.uuid4().hex[:14]
         e = {"id": i, "name": self.unique_name(parent, name), "type": typ, "parent_id": parent,
              "file_size": len(data), "hash": h, "url": f"api/v1/file-entries/download/{h}" if typ != "folder" else None,
-             "data": data, "deleted": False, "created_at": "2026-11-04T10:00:00.000000Z",
+             "data": data, "deleted": False, "lost": typ != "folder" and random.random() < self.lose_rate,
+             "created_at": "2026-11-04T10:00:00.000000Z",
              "updated_at": "2026-11-04T10:00:00.000000Z"}
         self.entries[i] = e
         return e
 
 
 def public(e):
-    return {k: v for k, v in e.items() if k not in ("data", "deleted")}
+    return {k: v for k, v in e.items() if k not in ("data", "deleted", "lost")}
 
 
 def make_handler(state: State):
@@ -142,8 +144,14 @@ def make_handler(state: State):
                 return self._raw(200, headers={"ETag": f'"{hashlib.md5(body).hexdigest()}"'})
             if parts[1] == "r2" and method == "GET":
                 e = state.entries.get(int(parts[2]))
-                if e is None or e["deleted"]:
-                    return self._raw(404)
+                if e is None or e["deleted"] or e["lost"]:
+                    return self._raw(404, b"<Error><Code>NoSuchKey</Code></Error>")
+                m = re.fullmatch(r"bytes=(\d+)-(\d+)", self.headers.get("Range") or "")
+                if m:
+                    a, b = int(m.group(1)), min(int(m.group(2)), len(e["data"]) - 1)
+                    return self._raw(206, e["data"][a:b + 1], {
+                        "Content-Range": f"bytes {a}-{b}/{len(e['data'])}",
+                        "Content-Type": "application/octet-stream"})
                 return self._raw(200, e["data"], {"Content-Type": "application/octet-stream"})
             return self._raw(405)
 

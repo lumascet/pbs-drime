@@ -1,0 +1,31 @@
+#!/bin/sh
+# Keep a PBS S3 datastore's local chunk cache in RAM instead of on disk.
+#
+# PBS writes every chunk it uploads to S3 into <datastore>/.chunks as well (an LRU
+# cache, evicted chunks become 0-byte markers). With a tmpfs on .chunks that data
+# never touches the SSD. Index files, manifests and GC status stay on disk.
+#
+# Usage: pbs-chunk-cache-tmpfs <datastore path> [tmpfs size]
+# Run before proxmox-backup(-proxy) starts (see pbs-chunk-cache-tmpfs@.service).
+# Keep the datastore's max-cache-size well below the tmpfs size.
+set -eu
+BASE="${1:?datastore path}"
+SIZE="${2:-1G}"
+D="$BASE/.chunks"
+[ -d "$D" ] || { echo "$D does not exist" >&2; exit 1; }
+owner=$(stat -c %u "$D"); group=$(stat -c %g "$D"); mode=$(stat -c %a "$D")
+sub_mode=$(stat -c %a "$D/0000" 2>/dev/null || echo 750)
+if ! mountpoint -q "$D"; then
+    mount -t tmpfs -o "size=$SIZE,mode=$mode,uid=$owner,gid=$group,nosuid,nodev,noexec" pbs-chunk-cache "$D"
+fi
+# PBS expects all 65536 prefix directories to exist.
+python3 - "$D" "$owner" "$group" "$sub_mode" <<'EOF'
+import os, sys
+d, uid, gid, mode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4], 8)
+for i in range(65536):
+    p = os.path.join(d, f"{i:04x}")
+    if not os.path.isdir(p):
+        os.mkdir(p, mode)
+        os.chown(p, uid, gid)
+EOF
+echo "chunk cache of $BASE on tmpfs ($SIZE)"

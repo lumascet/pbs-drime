@@ -1,0 +1,16 @@
+# Instance name = systemd-escaped datastore path, e.g.
+#   systemctl enable --now "pbs-chunk-cache-tmpfs@$(systemd-escape -p /mnt/pbs-drime-cache).service"
+# If this unit fails, PBS still starts and simply caches on disk again.
+[Unit]
+Description=RAM-backed chunk cache for PBS datastore at %f
+RequiresMountsFor=%f
+Before=proxmox-backup.service proxmox-backup-proxy.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=SIZE=1G
+ExecStart=/usr/local/sbin/pbs-chunk-cache-tmpfs %f ${SIZE}
+
+[Install]
+WantedBy=multi-user.target proxmox-backup-proxy.service

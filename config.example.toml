@@ -37,4 +37,7 @@ max_inflight = 64               # concurrent Drime uploads/downloads; throughput
 retries = 6
 http_timeout = 300
 max_object_size = 268435456      # 256 MiB; PBS objects are normally <= 16 MiB
+verify_uploads = true            # read 1 byte back after each upload; Drime has been seen
+                                 # acknowledging uploads whose data never reached storage
+prefill_chunk_folders = true     # create a datastore's 4096 chunk folders in the background
 log_level = "INFO"               # DEBUG logs every request

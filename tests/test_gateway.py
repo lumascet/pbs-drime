@@ -399,6 +399,47 @@ class GatewayTest(unittest.TestCase):
         for h in digests:
             self.assertEqual(self.store.get(f"pf/.chunks/{h[:4]}/{h}")[1], h.encode())
 
+    def test_lost_uploads_are_reuploaded(self):
+        """Drime acknowledges uploads whose data never reaches storage: the gateway must notice
+        and upload again, so every PUT that returned 200 is readable."""
+        self.mstate.lose_rate = 0.3
+        ct = {"content-type": "application/octet-stream", "if-none-match": "*"}
+        try:
+            items = {}
+            for i in range(30):
+                data = os.urandom(30_000 + i)
+                h = hashlib.sha256(data).hexdigest()
+                items[f"lost/.chunks/{h[:4]}/{h}"] = data
+                self.assertEqual(self.pbs.request("PUT", f"lost/.chunks/{h[:4]}/{h}", body=data, headers=ct)[0], 200)
+        finally:
+            self.mstate.lose_rate = 0.0
+        for k, v in items.items():
+            self.assertEqual(self.pbs.request("GET", k)[2], v, k)
+        live_lost = [e for e in self.mstate.entries.values() if e.get("lost") and not e["deleted"]]
+        self.assertEqual(live_lost, [], "broken entries left behind on Drime")
+
+    def test_lost_data_self_heals_and_scrub_finds_it(self):
+        ct = {"content-type": "application/octet-stream", "if-none-match": "*"}
+        data = os.urandom(50_000)
+        h = hashlib.sha256(data).hexdigest()
+        key = f"heal/.chunks/{h[:4]}/{h}"
+        self.assertEqual(self.pbs.request("PUT", key, body=data, headers=ct)[0], 200)
+        o = self.store.index.get(f"{STORE}/{key}")
+        self.mstate.entries[o.entry_id]["lost"] = True  # Drime loses it later
+        self.assertEqual(self.pbs.request("GET", key)[0], 404)  # verify sees it missing
+        # next backup with the same chunk must upload it again, not get 412
+        self.assertEqual(self.pbs.request("PUT", key, body=data, headers=ct)[0], 200)
+        self.assertEqual(self.pbs.request("GET", key)[2], data)
+        # scrub catches silent loss without a read from PBS
+        other = os.urandom(40_000)
+        h2 = hashlib.sha256(other).hexdigest()
+        key2 = f"heal/.chunks/{h2[:4]}/{h2}"
+        self.assertEqual(self.pbs.request("PUT", key2, body=other, headers=ct)[0], 200)
+        self.mstate.entries[self.store.index.get(f"{STORE}/{key2}").entry_id]["lost"] = True
+        st = self.store.scrub(f"{STORE}/heal/")
+        self.assertEqual((st["checked"], st["lost"]), (2, 1))
+        self.assertIsNone(self.store.index.get(f"{STORE}/{key2}"))
+
     def test_zz_rebuild_index(self):
         # runs last (alphabetical): everything uploaded so far must survive an index rebuild
         before = {o.key: o.size for o in self.store.list("", "", 10 ** 9, "")[0]}
