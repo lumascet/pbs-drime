@@ -148,6 +148,29 @@ proxmox-backup-manager verify-job create v-drime --store drime --schedule 'mon,w
   lost acknowledged data before, this is the check worth having.
 - **Without GC:** deleted snapshots never free space on Drime.
 
+### Storage used on Drime, and a limit
+
+The PBS UI computes a datastore's usage from the local cache directory, so for an S3 datastore it
+shows the cache, not Drime. To see the real numbers:
+
+- **The gateway knows them:** run `drime-s3gw usage` for the totals per datastore, the limit and the
+  Drime account.
+- **Show them in the PBS UI:** the `drime-s3gw-usage@<datastore>` timer writes the numbers into the
+  datastore's **comment** every hour, which is visible in the PBS datastore list:
+
+```bash
+install -m 644 'contrib/drime-s3gw-usage@.service' 'contrib/drime-s3gw-usage@.timer' /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now drime-s3gw-usage@drime.timer
+```
+
+- **The limit:** `max_total_size` (e.g. `"1TiB"`) caps what the gateway stores. Once it's reached:
+  - New chunks are refused with `403 QuotaExceeded`, so the backup fails with a clear error and your
+    PBS notifications report it.
+  - Chunks that already exist still deduplicate, metadata still writes, and prune and GC still free
+    space.
+- **Warning before the limit:** above `usage_warn_percent` (default 90%), the usage unit exits 1 about
+  once a day. Hook an `OnFailure=` alert to it.
+
 ### Hardening
 
 ```bash
@@ -217,8 +240,9 @@ systemctl enable --now drime-s3gw-scrub.timer drime-s3gw-index-backup.timer
 The data on Drime is self-contained. To bring it back on a new host:
 
 1. Install the gateway with the same `bucket`, `drime_root` and Drime token.
-2. Run `drime-s3gw rebuild-index --yes`. It walks the Drime folder tree and needs roughly one API call
-   per folder, so a large datastore takes about 30–60 minutes.
+2. Run `drime-s3gw rebuild-index --yes`. It walks the Drime folder tree, listing each tree level in
+   parallel. Measured: about 8,200 folders and 3,700 objects took 164 s, with a result identical to
+   the live index.
 3. Start the service. Recreate the PBS endpoint, and recreate the datastore **with the same name**,
    adding `--reuse-datastore true --overwrite-in-use true`. PBS then runs an S3 refresh to restore its
    local cache.
@@ -236,6 +260,8 @@ drime-s3gw [-c CONFIG] selftest          # round-trip test against your Drime ac
 drime-s3gw [-c CONFIG] rebuild-index --yes
 drime-s3gw [-c CONFIG] prefill STORE      # create a datastore's 4096 chunk folders up front
 drime-s3gw [-c CONFIG] scrub [--prefix P]  # check every object's data exists in Drime storage
+drime-s3gw [-c CONFIG] usage [--pbs-comment DATASTORE]  # storage used on Drime, limit, account
+drime-s3gw [-c CONFIG] migrate-layout [--dry-run]       # move 0.1.0-layout chunks to the current layout
 drime-s3gw [-c CONFIG] backup-index        # copy the index to Drime (_s3gw/index.sqlite)
 drime-s3gw [-c CONFIG] restore-index --yes # fetch that copy back (fast path; see below)
 drime-s3gw --index-db FILE <command>       # use another index file, e.g. rebuild into a scratch file

@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -86,6 +86,11 @@ class Config:
     readahead: bool = True  # prefetch the following chunks of a snapshot during restores
     readahead_window: int = 24  # chunks fetched ahead (in parallel) per restore stream
     readahead_cache_mib: int = 256  # RAM for prefetched chunks
+    # Upper limit for everything stored on Drime through this gateway, e.g. "1TiB" or
+    # "500GB"; empty = no limit. When reached, new chunks are refused (backups fail with
+    # an error); metadata writes, deletes and GC keep working so space can be freed.
+    max_total_size: str = ""
+    usage_warn_percent: int = 90  # `usage` exits 1 (once a day) above this share of the limit
     log_level: str = "INFO"
 
     @classmethod
@@ -551,6 +556,12 @@ class Index:
         args.append(limit)
         return [Obj(*r) for r in self._c().execute(sql, args)]
 
+    def usage_by_prefix(self) -> list[tuple[str, int, int]]:
+        """(first key segment, objects, bytes) - i.e. per PBS datastore."""
+        return self._c().execute(
+            "SELECT CASE WHEN instr(key,'/') > 0 THEN substr(key, 1, instr(key,'/') - 1) ELSE key END AS p,"
+            " count(*), coalesce(sum(size),0) FROM objects GROUP BY p ORDER BY 3 DESC").fetchall()
+
     def stats(self) -> tuple[int, int]:
         n, s = self._c().execute("SELECT count(*), coalesce(sum(size),0) FROM objects").fetchone()
         return n, s
@@ -635,6 +646,28 @@ def _is_md5_etag(etag: str) -> bool:
 
 
 CHUNK_KEY = re.compile(r"([^/]+)/\.chunks/[0-9a-f]{4}/([0-9a-f]{64})")
+
+_UNITS = {"": 1, "b": 1, "k": 1000, "kb": 1000, "m": 1000 ** 2, "mb": 1000 ** 2, "g": 1000 ** 3,
+          "gb": 1000 ** 3, "t": 1000 ** 4, "tb": 1000 ** 4, "p": 1000 ** 5, "pb": 1000 ** 5,
+          "kib": 1024, "mib": 1024 ** 2, "gib": 1024 ** 3, "tib": 1024 ** 4, "pib": 1024 ** 5}
+
+
+def parse_size(s) -> int:
+    """'1TiB', '500GB', '750 gib', '1048576' -> bytes; '' / None / 0 -> 0 (no limit)."""
+    if not s:
+        return 0
+    m = re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*([a-zA-Z]*)\s*", str(s))
+    if not m or m.group(2).lower() not in _UNITS:
+        raise SystemExit(f"invalid size {s!r} (examples: 1TiB, 500GB, 750GiB)")
+    return int(float(m.group(1)) * _UNITS[m.group(2).lower()])
+
+
+def fmt_size(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(n) < 1024 or unit == "PiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PiB"
 
 
 def parse_chunk_list(key: str, data: bytes) -> tuple[str, bytes] | None:
@@ -886,6 +919,35 @@ class Store:
         self.inflight = threading.BoundedSemaphore(max(1, cfg.max_inflight))
         self.readahead = ReadAhead(self, cfg.readahead_window, cfg.readahead_cache_mib) \
             if cfg.readahead else None
+        self.limit = parse_size(cfg.max_total_size)
+        self._used_lock = threading.Lock()
+        self._used = self.index.stats()[1]
+        self._used_at = time.monotonic()
+
+    # -- storage limit
+    def used_bytes(self) -> int:
+        """Bytes stored on Drime (from the index; refreshed every minute so changes made
+        by other processes such as scrub are picked up)."""
+        with self._used_lock:
+            if time.monotonic() - self._used_at > 60:
+                self._used = self.index.stats()[1]
+                self._used_at = time.monotonic()
+            return self._used
+
+    def _account(self, delta: int) -> None:
+        with self._used_lock:
+            self._used += delta
+
+    def _check_limit(self, key: str, grow: int) -> None:
+        if not self.limit or grow <= 0 or not CHUNK_KEY.fullmatch(key):
+            return  # metadata, overwrites that shrink, deletes: always allowed
+        used = self.used_bytes()
+        if used + grow > self.limit:
+            log.error("storage limit reached: %s used of %s; refusing new chunk %s",
+                      fmt_size(used), fmt_size(self.limit), key)
+            raise S3Error(403, "QuotaExceeded",
+                          f"Drime storage limit reached ({fmt_size(used)} of {fmt_size(self.limit)}); "
+                          "prune old backups and run GC, or raise max_total_size")
 
     def _key_lock(self, key: str) -> threading.Lock:
         return self.key_locks[int.from_bytes(hashlib.blake2s(key.encode(), digest_size=4).digest()) % 512]
@@ -1091,10 +1153,13 @@ class Store:
             if old is not None and if_none_match:
                 raise S3Error(412, "PreconditionFailed",
                               "At least one of the pre-conditions you specified did not hold")
+            grow = len(data) - (old.size if old else 0)
+            self._check_limit(key, grow)
             dname, payload = (name + EMPTY_SUFFIX, b"\0") if not data else (name, data)
             item = self._upload(folders, dname, payload, {old.entry_id} if old else set())
             obj = Obj(key, len(data), etag, time.time(), int(item["id"]), item.get("url"), item.get("hash"))
             self.index.put(obj)
+            self._account(grow)
             if old is not None and old.entry_id != obj.entry_id:
                 try:
                     self.drime.delete([old.entry_id], self.cfg.hard_delete)
@@ -1148,6 +1213,7 @@ class Store:
     def _forget_lost(self, o: Obj) -> None:
         with self._key_lock(o.key):
             self.index.delete_if(o.key, o.entry_id)
+        self._account(-o.size)
         if self.readahead is not None:
             self.readahead.discard([o.key])
         try:
@@ -1190,6 +1256,7 @@ class Store:
         for o in objs:
             with self._key_lock(o.key):
                 self.index.delete_if(o.key, o.entry_id)
+            self._account(-o.size)
             if o.key.endswith((".didx", ".fidx")):
                 self.index.delete_chunk_list(o.key)
         if self.readahead is not None:
@@ -1228,37 +1295,92 @@ class Store:
         return contents, prefixes, truncated, cursor
 
     # -- maintenance
-    def rebuild_index(self) -> dict:
+    def rebuild_index(self, workers: int = 16) -> dict:
+        """Recreate the index from Drime. Folders of one tree level are listed in parallel."""
+        from concurrent.futures import ThreadPoolExecutor
         root = self.folder_id(())
         self.index.clear()
         stats = {"objects": 0, "bytes": 0, "folders": 0, "duplicates": 0}
         seen: dict[str, float] = {}
-        stack: list[tuple[tuple[str, ...], int]] = [((), root)]
-        while stack:
-            rel, fid = stack.pop()
-            self.index.set_folder("/".join(self.root_parts + rel), fid)
-            stats["folders"] += 1
-            for item in self.drime.list_children(fid):
-                name = item.get("name") or ""
-                if item.get("type") == "folder":
-                    stack.append((rel + (name,), int(item["id"])))
-                    continue
-                size = int(item.get("file_size") or 0)
-                if name.endswith(EMPTY_SUFFIX):
-                    name, size = name[: -len(EMPTY_SUFFIX)], 0
-                key = location_to_key(rel, name)
-                mtime = _parse_time(item.get("updated_at") or item.get("created_at"))
-                if key in seen:
-                    stats["duplicates"] += 1
-                    log.warning("duplicate Drime entries for %s; keeping the newest", key)
-                    if mtime < seen[key]:
+        level: list[tuple[tuple[str, ...], int]] = [((), root)]
+        with ThreadPoolExecutor(max(1, workers)) as ex:
+            while level:
+                listings = list(ex.map(lambda rf: list(self.drime.list_children(rf[1])), level))
+                nxt: list[tuple[tuple[str, ...], int]] = []
+                for (rel, fid), items in zip(level, listings):
+                    self.index.set_folder("/".join(self.root_parts + rel), fid)
+                    stats["folders"] += 1
+                    if stats["folders"] % 1000 == 0:
+                        log.info("rebuild: %d folders, %d objects so far", stats["folders"], stats["objects"])
+                    for item in items:
+                        if item.get("type") == "folder":
+                            nxt.append((rel + (item.get("name") or "",), int(item["id"])))
+                        else:
+                            self._rebuild_item(rel, item, seen, stats)
+                level = nxt
+        return stats
+
+    def _rebuild_item(self, rel, item, seen, stats) -> None:
+        name = item.get("name") or ""
+        size = int(item.get("file_size") or 0)
+        if name.endswith(EMPTY_SUFFIX):
+            name, size = name[: -len(EMPTY_SUFFIX)], 0
+        key = location_to_key(rel, name)
+        mtime = _parse_time(item.get("updated_at") or item.get("created_at"))
+        if key in seen:
+            stats["duplicates"] += 1
+            log.warning("duplicate Drime entries for %s; keeping the newest", key)
+            if mtime < seen[key]:
+                return
+        else:
+            stats["objects"] += 1
+            stats["bytes"] += size
+        seen[key] = mtime
+        self.index.put(Obj(key, size, f'"drime-{item["id"]}"', mtime, int(item["id"]),
+                           item.get("url"), item.get("hash")))
+
+    def migrate_layout(self, dry_run: bool = False) -> dict:
+        """Move chunks still in the 0.1.0 layout (.chunks/ab/cd/<digest>) into the current one
+        (.chunks/abc/<digest>) and remove the emptied folders. Entry IDs don't change, so
+        the index stays valid; only the folder count (and rebuild time) goes down."""
+        stats = {"chunks": 0, "moved": 0, "folders_removed": 0}
+        root = self.folder_id(())
+        for st in list(self.drime.list_children(root, folders_only=True)):
+            chunks = self.drime.find_folder(int(st["id"]), ".chunks")
+            if chunks is None:
+                continue
+            store = st["name"]
+            for l1 in list(self.drime.list_children(int(chunks["id"]), folders_only=True)):
+                if not HEX2.fullmatch(l1["name"]):
+                    continue  # 3-hex folders are the current layout
+                for l2 in list(self.drime.list_children(int(l1["id"]), folders_only=True)):
+                    if not HEX2.fullmatch(l2["name"]):
                         continue
-                else:
-                    stats["objects"] += 1
-                    stats["bytes"] += size
-                seen[key] = mtime
-                self.index.put(Obj(key, size, f'"drime-{item["id"]}"', mtime, int(item["id"]),
-                                   item.get("url"), item.get("hash")))
+                    prefix4 = l1["name"] + l2["name"]
+                    files = [i for i in self.drime.list_children(int(l2["id"])) if i.get("type") != "folder"]
+                    groups: dict[str, list[int]] = {}
+                    for f in files:
+                        if not (f.get("name") or "").startswith(prefix4):
+                            log.warning("migrate: unexpected file %r in %s/%s; leaving it", f.get("name"),
+                                        l1["name"], l2["name"])
+                            continue
+                        groups.setdefault(f["name"][:3], []).append(int(f["id"]))
+                    stats["chunks"] += sum(len(v) for v in groups.values())
+                    if dry_run:
+                        continue
+                    for p3, ids in groups.items():
+                        dest = self.folder_id((store, ".chunks", p3))
+                        for i in range(0, len(ids), 100):
+                            self.drime.call("POST", "/file-entries/move",
+                                            json_body={"entryIds": ids[i:i + 100], "destinationId": dest})
+                            stats["moved"] += len(ids[i:i + 100])
+                    if not list(self.drime.list_children(int(l2["id"]))):
+                        self.drime.delete([int(l2["id"])], True)
+                        stats["folders_removed"] += 1
+                if not dry_run and not list(self.drime.list_children(int(l1["id"]))):
+                    self.drime.delete([int(l1["id"])], True)
+                    stats["folders_removed"] += 1
+                    self.index.forget_folders("/".join(self.root_parts + (store, ".chunks", l1["name"])))
         return stats
 
 
@@ -1795,6 +1917,8 @@ def cmd_serve(cfg: Config, args) -> int:
     log.info("drime-s3gw %s listening on %s:%s (%s), bucket %r -> Drime folder %r, %d objects / %.1f GiB",
              __version__, cfg.listen, cfg.port, "https" if cfg.tls else "http", cfg.bucket,
              cfg.drime_root, n, size / 1024 ** 3)
+    if store.limit:
+        log.info("storage limit %s (%.1f%% used)", fmt_size(store.limit), 100.0 * size / store.limit)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -1874,6 +1998,60 @@ def cmd_selftest(cfg: Config, args) -> int:
     store.index.forget_folders("/".join(store.root_parts + (base,)))
     print("PASS" if ok else "FAILED")
     return 0 if ok else 1
+
+
+def cmd_usage(cfg: Config, args) -> int:
+    """Show what is stored on Drime; optionally write it into a PBS datastore's comment
+    (visible in the PBS UI's datastore list) and exit 1 (once a day) above the warn level."""
+    store = _build(cfg)
+    n, used = store.index.stats()
+    limit = store.limit
+    print(f"stored on Drime via the gateway: {fmt_size(used)} in {n} objects")
+    for prefix, cnt, size in store.index.usage_by_prefix():
+        print(f"  {prefix:<20} {fmt_size(size):>12}  {cnt} objects")
+    pct = 100.0 * used / limit if limit else None
+    if limit:
+        print(f"limit: {fmt_size(limit)} ({pct:.1f}% used, {fmt_size(max(0, limit - used))} left)")
+    else:
+        print("limit: none (set max_total_size)")
+    acct = None
+    try:
+        su = store.drime.space_usage()
+        acct = (int(su.get("used", 0)), int(su.get("available", 0)))
+        print(f"Drime account: {fmt_size(acct[0])} used, {fmt_size(acct[1])} available")
+    except (DrimeError, ValueError, TypeError) as e:
+        print(f"Drime account usage unavailable: {e}")
+    if args.pbs_comment:
+        ds = args.pbs_comment
+        ds_used = next((s for p, _, s in store.index.usage_by_prefix() if p == ds), 0)
+        text = f"Drime: {fmt_size(ds_used)}"
+        if limit:
+            text += f" (gateway total {fmt_size(used)} of {fmt_size(limit)} limit, {pct:.0f}%)"
+        if acct:
+            text += f" | account {fmt_size(acct[0])} used, {fmt_size(acct[1])} free"
+        import subprocess
+        r = subprocess.run(["proxmox-backup-manager", "datastore", "update", ds, "--comment", text],
+                           capture_output=True, text=True)
+        print(f"PBS datastore {ds!r} comment: {text}" if r.returncode == 0
+              else f"could not update PBS comment: {r.stderr.strip()}")
+    if limit and pct >= cfg.usage_warn_percent:
+        state = os.path.join(os.path.dirname(os.path.abspath(cfg.index_db)), "usage-alert")
+        last = os.path.getmtime(state) if os.path.exists(state) else 0
+        print(f"WARNING: {pct:.1f}% of the storage limit used")
+        if time.time() - last > 23 * 3600:
+            open(state, "w").close()
+            return 1  # -> OnFailure alert, at most about once a day
+    return 0
+
+
+def cmd_migrate(cfg: Config, args) -> int:
+    store = _build(cfg)
+    t0 = time.monotonic()
+    st = store.migrate_layout(dry_run=args.dry_run)
+    verb = "would move" if args.dry_run else "moved"
+    print(f"{verb} {st['chunks'] if args.dry_run else st['moved']} chunks from the 0.1.0 layout, "
+          f"removed {st['folders_removed']} old folders ({time.monotonic() - t0:.0f}s)")
+    return 0
 
 
 def cmd_prefill(cfg: Config, args) -> int:
@@ -1996,6 +2174,11 @@ def main(argv=None) -> int:
     sub.add_parser("selftest", help="round-trip test objects through Drime")
     rb = sub.add_parser("rebuild-index", help="recreate the local index from Drime")
     rb.add_argument("--yes", action="store_true")
+    us = sub.add_parser("usage", help="show storage used on Drime (and the limit)")
+    us.add_argument("--pbs-comment", metavar="DATASTORE",
+                    help="also write the usage into this PBS datastore's comment")
+    mg = sub.add_parser("migrate-layout", help="move 0.1.0-layout chunks into the current layout")
+    mg.add_argument("--dry-run", action="store_true")
     pf = sub.add_parser("prefill", help="create all 4096 chunk folders of a datastore up front")
     pf.add_argument("store", help="PBS datastore name (the key prefix)")
     pf.add_argument("--workers", type=int, default=8)
@@ -2012,7 +2195,8 @@ def main(argv=None) -> int:
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s")
     cmd = {"serve": cmd_serve, "check": cmd_check, "selftest": cmd_selftest,
-           "rebuild-index": cmd_rebuild, "prefill": cmd_prefill,
+           "rebuild-index": cmd_rebuild, "prefill": cmd_prefill, "usage": cmd_usage,
+           "migrate-layout": cmd_migrate,
            "scrub": cmd_scrub, "backup-index": cmd_backup_index,
            "restore-index": cmd_restore_index}[args.cmd or "serve"]
     return cmd(cfg, args)

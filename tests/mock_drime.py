@@ -239,6 +239,15 @@ def make_handler(state: State):
                 for i in ids:
                     self._delete(i, j.get("deleteForever"))
                 return self._json(200, {"status": "success"})
+            if method == "POST" and p == "/file-entries/move":
+                j = json.loads(body)
+                dest = j["destinationId"]
+                if dest not in state.entries or any(i not in state.entries for i in j["entryIds"]):
+                    return self._json(422, {"message": "The entry ids is invalid."})
+                for i in j["entryIds"]:
+                    state.entries[i]["parent_id"] = dest
+                return self._json(200, {"status": "success", "entries": [public(state.entries[i])
+                                                                         for i in j["entryIds"]]})
             m = re.fullmatch(r"/file-entries/(\d+)", p)
             if method == "POST" and m and self.headers.get("X-HTTP-Method-Override") == "PUT":
                 e = state.entries.get(int(m.group(1)))

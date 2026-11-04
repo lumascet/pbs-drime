@@ -1,0 +1,11 @@
+# Instance = PBS datastore name whose comment shows the Drime usage, e.g. drime-s3gw-usage@drime
+[Unit]
+Description=Show Drime usage in the comment of PBS datastore %i
+After=drime-s3gw.service
+# exits 1 (about once a day) when usage_warn_percent of max_total_size is exceeded;
+# add an OnFailure= drop-in to get alerted
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/bin/python3 /usr/local/bin/drime-s3gw -c /etc/drime-s3gw/config.toml usage --pbs-comment %i

@@ -440,6 +440,56 @@ class GatewayTest(unittest.TestCase):
             st, _, got = self.pbs.request("GET", k)
             self.assertEqual((st, got), (200, v), k)
 
+    def test_storage_limit(self):
+        ct = {"content-type": "application/octet-stream", "if-none-match": "*"}
+        existing = os.urandom(10_000)
+        h0 = hashlib.sha256(existing).hexdigest()
+        self.assertEqual(self.pbs.request("PUT", f".chunks/{h0[:4]}/{h0}", body=existing, headers=ct)[0], 200)
+        self.assertEqual(gw.parse_size("1TiB"), 1024 ** 4)
+        self.assertEqual(gw.parse_size("500GB"), 500 * 1000 ** 3)
+        old_limit = self.store.limit
+        self.store.limit = self.store.used_bytes() + 50_000  # room for ~one more 40 KB chunk
+        try:
+            a = os.urandom(40_000)
+            ha = hashlib.sha256(a).hexdigest()
+            self.assertEqual(self.pbs.request("PUT", f".chunks/{ha[:4]}/{ha}", body=a, headers=ct)[0], 200)
+            b = os.urandom(40_000)
+            hb = hashlib.sha256(b).hexdigest()
+            st, _, xml = self.pbs.request("PUT", f".chunks/{hb[:4]}/{hb}", body=b, headers=ct)
+            self.assertEqual(st, 403)
+            self.assertIn(b"QuotaExceeded", xml)
+            # already-stored chunks still dedupe, metadata still writes, deletes free space
+            self.assertEqual(self.pbs.request("PUT", f".chunks/{h0[:4]}/{h0}", body=existing, headers=ct)[0], 412)
+            self.assertEqual(self.pbs.request("PUT", ".cnt/vm/1/owner", body=b"root@pam\n",
+                                              headers={"content-type": "application/octet-stream"})[0], 200)
+            self.assertEqual(self.pbs.request("DELETE", f".chunks/{ha[:4]}/{ha}")[0], 204)
+            self.assertEqual(self.pbs.request("PUT", f".chunks/{hb[:4]}/{hb}", body=b, headers=ct)[0], 200)
+        finally:
+            self.store.limit = old_limit
+
+    def test_migrate_old_layout(self):
+        # objects as 0.1.0 stored them: .chunks/ab/cd/<digest>
+        datas = [os.urandom(3000 + i) for i in range(6)]
+        keys = []
+        for data in datas:
+            h = hashlib.sha256(data).hexdigest()
+            key = f"{STORE}/.chunks/{h[:4]}/{h}"
+            pid = self.store.folder_id((STORE, ".chunks", h[:2], h[2:4]))
+            item = self.store.drime.upload_small(pid, h, data)
+            self.store.index.put(gw.Obj(key, len(data), f'"{hashlib.md5(data).hexdigest()}"', time.time(),
+                                        int(item["id"]), item.get("url"), item.get("hash")))
+            keys.append((key, data))
+        st = self.store.migrate_layout()
+        self.assertEqual(st["moved"], 6)
+        for key, data in keys:
+            self.assertEqual(self.store.get(key)[1], data)
+            h = key.rsplit("/", 1)[1]
+            new_fid = self.store.folder_id((STORE, ".chunks", h[:3]))
+            self.assertIn(h, [e["name"] for e in self.mstate.children(new_fid)])
+        chunks_id = self.store.folder_id((STORE, ".chunks"))
+        old = [e["name"] for e in self.mstate.children(chunks_id) if len(e["name"]) == 2]
+        self.assertEqual(old, [], "old 2-hex folders left behind")
+
     def test_index_backup_and_restore(self):
         import argparse
         self.store.put("idxbk/.chunks/abcd/abcd" + "0" * 60, b"x" * 100)

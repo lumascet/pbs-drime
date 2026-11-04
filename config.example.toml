@@ -44,4 +44,8 @@ prefill_chunk_folders = true     # create a datastore's 4096 chunk folders in th
 readahead = true                 # restores: prefetch the next chunks of the snapshot being read
 readahead_window = 24            # chunks fetched ahead in parallel
 readahead_cache_mib = 256        # RAM for prefetched chunks
+max_total_size = ""              # upper limit on Drime, e.g. "1TiB" / "500GB"; "" = none.
+                                 # When reached, new chunks are refused (backups fail);
+                                 # metadata, deletes and GC still work so space can be freed.
+usage_warn_percent = 90          # `usage` exits 1 (~once a day) above this -> alert
 log_level = "INFO"               # DEBUG logs every request
