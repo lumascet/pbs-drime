@@ -18,8 +18,13 @@ Drime has no S3 interface. It has its own REST API, so the gateway translates be
 It is a single Python file that uses only the standard library, so nothing has to be installed on the
 hypervisor.
 
-> **Status: tested against a mock of the Drime API only.** Run `drime-s3gw selftest` against your
-> account before trusting it with backups; see [First run](#first-run).
+> **Status: in use against a real Drime account with PBS 4.2.**
+> - **Tested on real Drime:** real CT and VM backups, verify, a full CT restore, and a disaster-recovery
+>   rebuild of the index from Drime alone.
+> - **Drime has silently lost acknowledged uploads before,** which is why every upload is read back
+>   and checked (see below).
+> - **Before you rely on it:** run `drime-s3gw selftest` against your own account; see
+>   [First run](#first-run).
 
 ## Requirements
 
