@@ -31,6 +31,7 @@ class State:
         self.fail_rate = 0.0
         self.latency = 0.0  # seconds added to every API call (not to storage PUT/GET)
         self.lose_rate = 0.0  # fraction of acknowledged uploads whose data never reaches storage
+        self.corrupt_rate = 0.0  # fraction of uploads stored with one flipped byte (same size)
         self.calls: dict[str, int] = {}
         self.auth_leaks = 0
         self.alt_host = ""  # host:port used for download redirects
@@ -53,6 +54,8 @@ class State:
         return f"{name} ({n})"
 
     def add(self, parent, name, typ, data=b""):
+        if typ != "folder" and data and random.random() < self.corrupt_rate:
+            data = bytes([data[0] ^ 0xFF]) + data[1:]
         i = self.new_id()
         h = uuid.uuid4().hex[:14]
         e = {"id": i, "name": self.unique_name(parent, name), "type": typ, "parent_id": parent,

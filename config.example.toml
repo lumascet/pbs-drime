@@ -37,8 +37,9 @@ max_inflight = 64             # concurrent Drime uploads/downloads; throughput i
 retries = 6
 http_timeout = 300
 max_object_size = 268435456      # 256 MiB; PBS objects are normally <= 16 MiB
-verify_uploads = true            # read 1 byte back after each upload; Drime has been seen
-                                 # acknowledging uploads whose data never reached storage
+verify_uploads = true            # true: read 1 byte back after each upload; "full": read it
+                                 # all back and compare MD5. Drime has been seen acknowledging
+                                 # uploads whose data never reached storage.
 prefill_chunk_folders = true     # create a datastore's 4096 chunk folders in the background
 readahead = true                 # restores: prefetch the next chunks of the snapshot being read
 readahead_window = 24            # chunks fetched ahead in parallel

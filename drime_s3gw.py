@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -80,7 +80,9 @@ class Config:
     http_timeout: float = 300.0
     max_object_size: int = 256 * MiB
     prefill_chunk_folders: bool = True
-    verify_uploads: bool = True  # read one byte back after each upload; re-upload if missing
+    # After each upload: true/"exists" reads one byte back (data present, size right);
+    # "full" downloads it and compares MD5 (also catches corruption); false skips it.
+    verify_uploads: object = True
     readahead: bool = True  # prefetch the following chunks of a snapshot during restores
     readahead_window: int = 24  # chunks fetched ahead (in parallel) per restore stream
     readahead_cache_mib: int = 256  # RAM for prefetched chunks
@@ -983,10 +985,11 @@ class Store:
     def _upload(self, folders, dname: str, payload: bytes, exclude: set[int]):
         """Upload and, if enabled, confirm the data actually reached Drime's storage."""
         lost = 0
+        mode = str(self.cfg.verify_uploads).lower()
         while True:
             with self.inflight:  # only the upload itself takes one of the max_inflight slots
                 item = self._upload_once(folders, dname, payload, exclude)
-            if not self.cfg.verify_uploads or self._landed(item, len(payload)):
+            if mode in ("false", "off", "0", "no") or self._landed(item, payload, full=mode == "full"):
                 if lost:
                     log.info("%s stored correctly after %d re-upload(s)", dname, lost)
                 return item
@@ -1001,7 +1004,26 @@ class Store:
                 raise DrimeError(0, f"Drime kept losing the data of {dname}")
             self.drime.backoff(lost)
 
-    def _landed(self, item, size: int) -> bool:
+    def _landed(self, item, payload: bytes, full: bool = False) -> bool:
+        size = len(payload)
+        if full:
+            want = hashlib.md5(payload).digest()
+            for attempt in (1, 2):
+                try:
+                    data = self.drime.download(item.get("url"), item.get("hash"))
+                except DrimeError as e:
+                    if e.status not in (404, 410):
+                        raise
+                    data = None
+                if data is not None and hashlib.md5(data).digest() == want:
+                    return True
+                if data is not None:
+                    log.warning("entry %s: stored content differs from upload (%d of %d bytes)",
+                                item.get("id"), len(data), size)
+                    return False
+                if attempt == 1:
+                    time.sleep(1.5)
+            return False
         for attempt in (1, 2):  # second look in case storage is briefly behind the API
             got = self.drime.stored_size(item.get("url"), item.get("hash"))
             if got == size:
@@ -1862,6 +1884,82 @@ def cmd_prefill(cfg: Config, args) -> int:
     return 0
 
 
+INDEX_BACKUP_KEY = "_s3gw/index.sqlite"
+
+
+def _scratch_path(name: str) -> str:
+    """Temporary file in RAM where possible (/run is tmpfs on Linux), to spare the SSD."""
+    import tempfile
+    base = "/run" if os.path.isdir("/run") and os.access("/run", os.W_OK) else tempfile.gettempdir()
+    return os.path.join(base, f"drime-s3gw-{name}-{os.getpid()}.sqlite")
+
+
+def cmd_backup_index(cfg: Config, args) -> int:
+    """Copy the live index (consistent SQLite backup) to Drime as _s3gw/index.sqlite."""
+    store = _build(cfg)
+    tmp = _scratch_path("index-backup")
+    try:
+        src, dst = sqlite3.connect(cfg.index_db), sqlite3.connect(tmp)
+        src.backup(dst)
+        dst.close()
+        src.close()
+        with open(tmp, "rb") as f:
+            data = f.read()
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    if len(data) > cfg.max_object_size:
+        print(f"index is {len(data)} bytes, above max_object_size; not backed up")
+        return 1
+    store.put(INDEX_BACKUP_KEY, data)
+    print(f"index backed up to Drime ({len(data) / MiB:.1f} MiB, {store.index.stats()[0]} objects)")
+    return 0
+
+
+def cmd_restore_index(cfg: Config, args) -> int:
+    """Fetch the index copy made by backup-index. Objects uploaded after that copy are
+    unknown to it, so rebuild-index is the authoritative way back; this is the fast path
+    when no backups ran since (or rebuild-index is impossible)."""
+    if not args.yes:
+        print("Overwrites the local index with the copy on Drime. Objects stored after that copy\n"
+              "will be unknown (prefer rebuild-index if backups ran since). Stop the gateway,\n"
+              "then re-run with --yes.")
+        return 2
+    cfg.require("drime_token")
+    drime = Drime(cfg)
+    parent = None
+    root = tuple(p for p in cfg.drime_root.split("/") if p)
+    folders, name = key_to_location(INDEX_BACKUP_KEY)
+    for part in root + folders:
+        hit = drime.find_folder(parent, part)
+        if hit is None:
+            print(f"no index backup on Drime (folder {part!r} missing)")
+            return 1
+        parent = int(hit["id"])
+    items = [i for i in drime.list_children(parent) if i.get("name") == name and i.get("type") != "folder"]
+    if not items:
+        print("no index backup on Drime")
+        return 1
+    item = max(items, key=lambda i: i.get("updated_at") or "")
+    data = drime.download(item.get("url"), item.get("hash"))
+    tmp = cfg.index_db + ".restoring"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    c = sqlite3.connect(tmp)
+    ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+    c.close()
+    if ok != "ok":
+        os.unlink(tmp)
+        print(f"downloaded index copy is damaged ({ok}); use rebuild-index")
+        return 1
+    for suffix in ("-wal", "-shm"):
+        if os.path.exists(cfg.index_db + suffix):
+            os.unlink(cfg.index_db + suffix)
+    os.replace(tmp, cfg.index_db)
+    print(f"index restored from Drime copy of {item.get('updated_at')} ({len(data) / MiB:.1f} MiB)")
+    return 0
+
+
 def cmd_scrub(cfg: Config, args) -> int:
     store = _build(cfg)
     t0 = time.monotonic()
@@ -1890,6 +1988,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="drime-s3gw", description=__doc__.split("\n\n")[0])
     ap.add_argument("-c", "--config", default=os.environ.get("DRIME_S3GW_CONFIG", "/etc/drime-s3gw/config.toml"))
     ap.add_argument("--version", action="version", version=__version__)
+    ap.add_argument("--index-db", help="use this index file instead of the configured one "
+                                       "(e.g. rebuild-index into a scratch file to compare)")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("serve", help="run the S3 gateway (default)")
     sub.add_parser("check", help="test the Drime token and show usage")
@@ -1902,13 +2002,19 @@ def main(argv=None) -> int:
     sc = sub.add_parser("scrub", help="check every object's data exists in Drime storage")
     sc.add_argument("--prefix", default="", help="only keys starting with this, e.g. 'drime/'")
     sc.add_argument("--workers", type=int, default=16)
+    sub.add_parser("backup-index", help="copy the local index to Drime (_s3gw/index.sqlite)")
+    ri = sub.add_parser("restore-index", help="restore the local index from its copy on Drime")
+    ri.add_argument("--yes", action="store_true")
     args = ap.parse_args(argv)
     cfg = Config.load(args.config)
+    if args.index_db:
+        cfg.index_db = args.index_db
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s")
     cmd = {"serve": cmd_serve, "check": cmd_check, "selftest": cmd_selftest,
            "rebuild-index": cmd_rebuild, "prefill": cmd_prefill,
-           "scrub": cmd_scrub}[args.cmd or "serve"]
+           "scrub": cmd_scrub, "backup-index": cmd_backup_index,
+           "restore-index": cmd_restore_index}[args.cmd or "serve"]
     return cmd(cfg, args)
 
 

@@ -1,0 +1,10 @@
+[Unit]
+Description=Check every object stored by drime-s3gw still exists on Drime
+After=drime-s3gw.service
+# Add an alert, e.g. via a drop-in:  OnFailure=notify-telegram@%n.service
+# (scrub exits 1 when it found lost objects; they are re-uploaded by the next backup)
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/bin/python3 /usr/local/bin/drime-s3gw -c /etc/drime-s3gw/config.toml scrub

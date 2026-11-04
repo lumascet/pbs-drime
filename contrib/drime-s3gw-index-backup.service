@@ -1,0 +1,8 @@
+[Unit]
+Description=Copy the drime-s3gw index to Drime (_s3gw/index.sqlite)
+After=drime-s3gw.service
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/bin/python3 /usr/local/bin/drime-s3gw -c /etc/drime-s3gw/config.toml backup-index

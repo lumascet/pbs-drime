@@ -419,6 +419,40 @@ class GatewayTest(unittest.TestCase):
         live_lost = [e for e in self.mstate.entries.values() if e.get("lost") and not e["deleted"]]
         self.assertEqual(live_lost, [], "broken entries left behind on Drime")
 
+    def test_full_verify_catches_corruption(self):
+        """verify_uploads='full' re-uploads when Drime stores different bytes of the same size
+        (the 1-byte existence check cannot see that)."""
+        self.cfg.verify_uploads = "full"
+        self.mstate.corrupt_rate = 0.4
+        ct = {"content-type": "application/octet-stream", "if-none-match": "*"}
+        try:
+            items = {}
+            for i in range(20):
+                data = os.urandom(20_000 + i)
+                h = hashlib.sha256(data).hexdigest()
+                items[f"corrupt/.chunks/{h[:4]}/{h}"] = data
+                self.assertEqual(self.pbs.request("PUT", f"corrupt/.chunks/{h[:4]}/{h}", body=data,
+                                                  headers=ct)[0], 200)
+        finally:
+            self.mstate.corrupt_rate = 0.0
+            self.cfg.verify_uploads = True
+        for k, v in items.items():
+            st, _, got = self.pbs.request("GET", k)
+            self.assertEqual((st, got), (200, v), k)
+
+    def test_index_backup_and_restore(self):
+        import argparse
+        self.store.put("idxbk/.chunks/abcd/abcd" + "0" * 60, b"x" * 100)
+        n_before = self.store.index.stats()[0]
+        self.assertEqual(gw.cmd_backup_index(self.cfg, argparse.Namespace()), 0)
+        cfg2 = gw.Config(**{f.name: getattr(self.cfg, f.name) for f in gw.fields(gw.Config)})
+        cfg2.index_db = os.path.join(self.tmp, "restored.sqlite")
+        open(cfg2.index_db, "wb").close()
+        self.assertEqual(gw.cmd_restore_index(cfg2, argparse.Namespace(yes=True)), 0)
+        restored = gw.Index(cfg2.index_db)
+        self.assertGreaterEqual(restored.stats()[0], n_before - 1)
+        self.assertIsNotNone(restored.get(f"idxbk/.chunks/abcd/abcd{'0' * 60}"))
+
     def test_lost_data_self_heals_and_scrub_finds_it(self):
         ct = {"content-type": "application/octet-stream", "if-none-match": "*"}
         data = os.urandom(50_000)

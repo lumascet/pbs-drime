@@ -134,7 +134,37 @@ drime-s3gw prefill drime     # create the 4096 chunk folders on Drime before the
     40 chunks/s, about 35 MiB/s.
 
 Then add the datastore to PVE as usual (Datacenter → Storage → Add → Proxmox Backup Server), and
-schedule **verify**, **prune** and **GC** jobs on it.
+schedule jobs on it:
+
+```bash
+proxmox-backup-manager datastore update drime --gc-schedule 'sun 03:00' --verify-new true
+proxmox-backup-manager prune-job create p-drime --store drime --schedule 'mon,wed,sat 21:30' \
+  --keep-daily 7 --keep-weekly 1 --keep-monthly 1
+proxmox-backup-manager verify-job create v-drime --store drime --schedule 'mon,wed,sat 23:00' \
+  --ignore-verified true --outdated-after 30
+```
+
+- **`verify-new`:** every backup is read back from Drime right after it finishes. Since Drime has
+  lost acknowledged data before, this is the check worth having.
+- **Without GC:** deleted snapshots never free space on Drime.
+
+### Hardening
+
+```bash
+install -m 644 contrib/drime-s3gw-{scrub,index-backup}.{service,timer} /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now drime-s3gw-scrub.timer drime-s3gw-index-backup.timer
+```
+
+- **Upload check:** set `verify_uploads = "full"` to read every upload back completely and compare
+  its MD5. This also catches corrupted content, not just missing data. It doubles download traffic
+  during backups.
+- **Alerts:** add `OnFailure=` drop-ins, e.g. a Telegram or mail unit, for `drime-s3gw`,
+  `drime-s3gw-scrub`, `drime-s3gw-index-backup` and `pbs-chunk-cache-tmpfs@`. The scrub exits 1
+  when it finds lost objects.
+- **Encryption key:** back it up off the host, e.g.
+  `proxmox-backup-client key paperkey /etc/pve/priv/storage/<storage>.enc --output-format text`
+  into your password manager. Without it, the backups on Drime cannot be restored.
 
 ## How it maps to Drime
 
@@ -206,7 +236,17 @@ drime-s3gw [-c CONFIG] selftest          # round-trip test against your Drime ac
 drime-s3gw [-c CONFIG] rebuild-index --yes
 drime-s3gw [-c CONFIG] prefill STORE      # create a datastore's 4096 chunk folders up front
 drime-s3gw [-c CONFIG] scrub [--prefix P]  # check every object's data exists in Drime storage
+drime-s3gw [-c CONFIG] backup-index        # copy the index to Drime (_s3gw/index.sqlite)
+drime-s3gw [-c CONFIG] restore-index --yes # fetch that copy back (fast path; see below)
+drime-s3gw --index-db FILE <command>       # use another index file, e.g. rebuild into a scratch file
 ```
+
+**Index backup vs rebuild:**
+- **`rebuild-index` is authoritative:** it reconstructs the index from what is actually on Drime.
+- **`restore-index` is faster but can be stale:** it doesn't know objects stored after the last
+  `backup-index`.
+- **Check the rebuild without risk:**
+  `drime-s3gw --index-db /run/test.sqlite rebuild-index --yes`, then compare it with the live index.
 
 `scrub` makes one cheap ranged request per object; it checked about 800 objects in 25 s. It exits
 with status 1 if it finds lost objects, so it can run from a timer and alert you.

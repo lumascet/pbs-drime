@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly copy of the drime-s3gw index to Drime
+
+[Timer]
+OnCalendar=*-*-* 04:30
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
