@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -74,8 +74,8 @@ class Config:
     workspace_id: int = 0
     index_db: str = "/var/lib/drime-s3gw/index.sqlite"
     hard_delete: bool = True
-    requests_per_minute: int = 1800
-    max_inflight: int = 64
+    requests_per_minute: int = 6000  # Drime reports x-ratelimit-limit: 10000 (per minute)
+    max_inflight: int = 64  # more made Drime slower and drop connections in tests
     retries: int = 6
     http_timeout: float = 300.0
     max_object_size: int = 256 * MiB
@@ -267,6 +267,10 @@ class Drime:
                     self.backoff(attempt)
                     continue
                 raise DrimeError(0, f"{type(e).__name__}: {e}") from e
+            remaining = rh.get("x-ratelimit-remaining")
+            if remaining is not None and remaining.isdigit() and int(remaining) < 300:
+                # close to Drime's per-minute budget: slow down before it starts refusing
+                time.sleep(0.5 * (1 - int(remaining) / 300) + 0.05)
             if status in RETRY_STATUS and attempt <= self.cfg.retries and (retry == "all" or status == 429):
                 log.debug("drime %s %s: HTTP %s, retrying", method, path or "<url>", status)
                 self.backoff(attempt, rh.get("retry-after"))
@@ -693,13 +697,27 @@ class ReadAhead:
         self.pool = ThreadPoolExecutor(self.window, thread_name_prefix="readahead")
         self.backfilled: set[str] = set()
         self.stats = {"hits": 0, "misses": 0, "prefetched": 0, "wasted": 0}
+        self.active = 0  # chunk GETs from clients currently being served
+
+    # A restore reads one chunk at a time; a verify job reads many in parallel (and in
+    # its own order, so prefetching for it is wasted requests). Only follow readers
+    # while at most this many chunk requests are in flight.
+    MAX_CONCURRENT_FOR_NEW_STREAM = 2
 
     # -- request path
     def fetch(self, key: str, loader) -> bytes:
         m = CHUNK_KEY.fullmatch(key)
         if not m:
             return loader()
-        store, digest = m.group(1), m.group(2)
+        with self.lock:
+            self.active += 1
+        try:
+            return self._fetch(key, m.group(1), m.group(2), loader)
+        finally:
+            with self.lock:
+                self.active -= 1
+
+    def _fetch(self, key: str, store: str, digest: str, loader) -> bytes:
         with self.lock:
             ent = self.cache.get(key)
             ev = self.pending.get(key) if ent is None else None
@@ -766,6 +784,9 @@ class ReadAhead:
                     self._schedule(st)
                     return
         self._ensure_lists(store)
+        with self.lock:
+            if self.active > self.MAX_CONCURRENT_FOR_NEW_STREAM:
+                return  # parallel reader (verify job): don't start following it
         hit = self.store.index.find_in_chunk_lists(store, bytes.fromhex(digest))
         if hit is None:
             return
@@ -963,7 +984,8 @@ class Store:
         """Upload and, if enabled, confirm the data actually reached Drime's storage."""
         lost = 0
         while True:
-            item = self._upload_once(folders, dname, payload, exclude)
+            with self.inflight:  # only the upload itself takes one of the max_inflight slots
+                item = self._upload_once(folders, dname, payload, exclude)
             if not self.cfg.verify_uploads or self._landed(item, len(payload)):
                 if lost:
                     log.info("%s stored correctly after %d re-upload(s)", dname, lost)
@@ -1048,8 +1070,7 @@ class Store:
                 raise S3Error(412, "PreconditionFailed",
                               "At least one of the pre-conditions you specified did not hold")
             dname, payload = (name + EMPTY_SUFFIX, b"\0") if not data else (name, data)
-            with self.inflight:
-                item = self._upload(folders, dname, payload, {old.entry_id} if old else set())
+            item = self._upload(folders, dname, payload, {old.entry_id} if old else set())
             obj = Obj(key, len(data), etag, time.time(), int(item["id"]), item.get("url"), item.get("hash"))
             self.index.put(obj)
             if old is not None and old.entry_id != obj.entry_id:

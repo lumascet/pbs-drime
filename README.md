@@ -112,7 +112,7 @@ proxmox-backup-manager s3 endpoint create drime \
   --endpoint 127.0.0.1 --port 8443 --path-style true --region us-west-1 \
   --access-key '<access_key>' --secret-key '<secret_key>' \
   --fingerprint '<AA:BB:...:FF from the openssl command above>' \
-  --limit-active-requests 40 --limit-passive-requests 40
+  --limit-active-requests 100 --limit-passive-requests 150
 
 proxmox-backup-manager datastore create drime /mnt/pbs-drime-cache \
   --backend type=s3,client=drime,bucket=pbs,max-cache-size=256MiB
@@ -127,9 +127,11 @@ drime-s3gw prefill drime     # create the 4096 chunk folders on Drime before the
   dataset quota.
 - **Verify readers:** 32 parallel readers is the maximum PBS allows. One measured verify read from
   Drime at about 100 MiB/s with 32 readers.
-- The request limits are a safety net. The gateway enforces Drime's API budget of about 2,000
-  requests per minute itself (`requests_per_minute`), so set the PBS limits high enough that PBS
-  keeps enough uploads in flight.
+- **Request limits:** these are only a safety net. The gateway enforces Drime's API budget itself
+  (`requests_per_minute`; Drime reports `x-ratelimit-limit: 10000` per minute) and slows down when
+  Drime reports few requests remaining.
+  - Don't set the PBS limits low: with small chunks, `--limit-passive-requests 40` capped verify at
+    40 chunks/s, about 35 MiB/s.
 
 Then add the datastore to PVE as usual (Datacenter → Storage → Add → Proxmox Backup Server), and
 schedule **verify**, **prune** and **GC** jobs on it.
@@ -226,9 +228,14 @@ wait entirely.
   `aws-chunked` uploads.
 - **Throughput:** each chunk upload is one `POST /uploads`, which takes 0.7–5 s depending on load,
   so throughput comes from parallelism (`max_inflight`, default 64).
-  - **Measured on a 250 Mbit/s uplink:** real PBS backups reached 26–30 MiB/s, about 220–250 Mbit/s,
-    with 64 uploads in flight. That is essentially the full line.
-  - **Verify:** with 32 readers, verify read at about 100 MiB/s.
+  - **Measured on a 250 Mbit/s uplink:** uploads reach 195–240 Mbit/s with 64 in flight, for 1.3 MiB
+    chunks as well as 4 MiB chunks. That is essentially the full line.
+    - **The read-back check:** it runs outside the 64 upload slots, so it doesn't reduce the number
+      of uploads in progress.
+    - **Beyond 64 uploads at once:** Drime gets slower and starts dropping connections.
+  - **Verify:** with 32 readers, verify read at about 100 MiB/s (about 800–900 Mbit/s), with small
+    chunks too. A real 7 GiB CT verified in 67 s. Read-ahead stays out of verify jobs; it only
+    follows single sequential readers.
   - **Restores:** PBS restores fetch chunks strictly one at a time. Without help they run at
     chunk size divided by latency, about 10 MiB/s here. The gateway therefore remembers the chunk
     order of every index file PBS writes (`.didx`/`.fidx`, about 8 MB per TB per snapshot).

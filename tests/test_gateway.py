@@ -479,6 +479,31 @@ class GatewayTest(unittest.TestCase):
         hits = int(s.split("hits ")[1].split()[0])
         self.assertGreaterEqual(hits, 40)
 
+    def test_readahead_stays_out_of_parallel_verify(self):
+        from concurrent.futures import ThreadPoolExecutor
+        chunks = self._snapshot("903", 64)
+        ra = self.store.readahead
+        ra.summary()
+        order = chunks[:]
+        random.Random(3).shuffle(order)
+        local = threading.local()
+
+        def get(kv):
+            if not hasattr(local, "c"):
+                local.c = PBSClient(self.port)
+            return local.c.request("GET", kv[0])[2] == kv[1]
+
+        self.mstate.latency = 0.05
+        try:
+            with ThreadPoolExecutor(16) as ex:  # like a verify job with 16 readers
+                self.assertTrue(all(ex.map(get, order)))
+        finally:
+            self.mstate.latency = 0.0
+        s = ra.summary()
+        prefetched = int(s.split("prefetched ")[1].split()[0]) if s else 0
+        print(f"\n  16 parallel readers, shuffled: {s or 'no read-ahead activity'}")
+        self.assertLessEqual(prefetched, ra.window, "read-ahead kept prefetching for a parallel reader")
+
     def test_readahead_fixed_index_and_wrong_order(self):
         chunks = self._snapshot("902", 40, ext=".fidx")
         random.seed(7)

@@ -31,8 +31,8 @@ workspace_id = 0                 # 0 = personal space
 index_db = "/var/lib/drime-s3gw/index.sqlite"
 
 hard_delete = true               # GC'd chunks skip the Drime trash
-requests_per_minute = 1800       # Drime allows ~2000 API requests/min per account
-max_inflight = 64               # concurrent Drime uploads/downloads; throughput is
+requests_per_minute = 6000       # Drime reports x-ratelimit-limit: 10000 per minute
+max_inflight = 64             # concurrent Drime uploads/downloads; throughput is
                                  # roughly max_inflight * 4 MiB / Drime upload latency
 retries = 6
 http_timeout = 300
