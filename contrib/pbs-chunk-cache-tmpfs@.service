@@ -1,5 +1,5 @@
 # Instance name = systemd-escaped datastore path, e.g.
-#   systemctl enable --now "pbs-chunk-cache-tmpfs@$(systemd-escape -p /mnt/pbs-drime-cache).service"
+#   systemctl enable --now "pbs-chunk-cache-tmpfs@$(systemd-escape -p /mnt/datastore/drime).service"
 # If this unit fails, PBS still starts and simply caches on disk again.
 [Unit]
 Description=RAM-backed chunk cache for PBS datastore at %f

@@ -77,18 +77,31 @@ recommends 64–128 GiB.
 **By default PBS writes every chunk it uploads into the cache as well, so the SSD gets a full copy of
 every backup's data written to it.** To avoid that, keep only the cache's `.chunks` directory in RAM
 (tmpfs) and limit `max-cache-size`. Index files and manifests stay on disk; they are small, roughly
-8 MB per TB of backups:
+8 MB per TB of backups.
+
+The recommended layout puts the cache directory on a **sparse ext4 image** whose size equals
+`max_total_size`. That's what lets the PBS gauge show the Drime usage; see
+[Storage used on Drime, and a limit](#storage-used-on-drime-and-a-limit). The image lives in a ZFS
+dataset with compression, so it costs almost nothing on disk:
 
 ```bash
-zfs create -o quota=8G -o atime=on -o relatime=on -o mountpoint=/mnt/pbs-drime-cache rpool/pbs-drime-cache
+zfs create -o compression=lz4 -o quota=8G -o mountpoint=/var/lib/pbs-drime rpool/pbs-drime
+truncate -s 3T /var/lib/pbs-drime/drime.img            # = max_total_size
+mkfs.ext4 -F -m 0 -N 1000000 -I 256 -J size=64 -E lazy_itable_init=1,lazy_journal_init=1 /var/lib/pbs-drime/drime.img
+mkdir -p /mnt/datastore/drime
+echo '/var/lib/pbs-drime/drime.img /mnt/datastore/drime ext4 loop,nofail,x-systemd.requires-mounts-for=/var/lib/pbs-drime 0 0' >> /etc/fstab
+systemctl daemon-reload && mount /mnt/datastore/drime && rmdir /mnt/datastore/drime/lost+found
+
 install -m 755 contrib/pbs-chunk-cache-tmpfs /usr/local/sbin/
 install -m 644 'contrib/pbs-chunk-cache-tmpfs@.service' /etc/systemd/system/
 systemctl daemon-reload
 # after `datastore create` below (it creates .chunks):
 systemctl stop proxmox-backup-proxy proxmox-backup
-systemctl enable --now "pbs-chunk-cache-tmpfs@$(systemd-escape -p /mnt/pbs-drime-cache).service"
+systemctl enable --now "pbs-chunk-cache-tmpfs@$(systemd-escape -p /mnt/datastore/drime).service"
 systemctl start proxmox-backup proxmox-backup-proxy
 ```
+
+If you don't want the gauge, a plain ZFS dataset mounted at `/mnt/datastore/drime` works just as well.
 
 The unit mounts a 1 GiB tmpfs on `.chunks` and creates PBS's 65,536 prefix directories before PBS
 starts. With `max-cache-size=256MiB`, at most 16 chunks are cached, and markers for the rest are
@@ -114,7 +127,7 @@ proxmox-backup-manager s3 endpoint create drime \
   --fingerprint '<AA:BB:...:FF from the openssl command above>' \
   --limit-active-requests 100 --limit-passive-requests 150
 
-proxmox-backup-manager datastore create drime /mnt/pbs-drime-cache \
+proxmox-backup-manager datastore create drime /mnt/datastore/drime \
   --backend type=s3,client=drime,bucket=pbs,max-cache-size=256MiB
 proxmox-backup-manager datastore update drime \
   --tuning default-verification-readers=32,default-verification-workers=4
@@ -155,13 +168,25 @@ shows the cache, not Drime. To see the real numbers:
 
 - **The gateway knows them:** run `drime-s3gw usage` for the totals per datastore, the limit and the
   Drime account.
-- **Show them in the PBS UI:** the `drime-s3gw-usage@<datastore>` timer writes the numbers into the
-  datastore's **comment** every hour, which is visible in the PBS datastore list:
+- **Show them in the PBS UI:** the `drime-s3gw-usage@<datastore>` timer runs every 15 minutes. It does
+  two things:
+  - It writes the numbers into the datastore's **comment**, which is visible in the PBS datastore
+    list.
+  - With the sparse-image layout above, it also adjusts a reservation file so the **usage gauge**
+    shows the Drime usage against the image size, i.e. against your limit.
 
 ```bash
 install -m 644 'contrib/drime-s3gw-usage@.service' 'contrib/drime-s3gw-usage@.timer' /etc/systemd/system/
+mkdir -p '/etc/systemd/system/drime-s3gw-usage@.service.d'
+cat > '/etc/systemd/system/drime-s3gw-usage@.service.d/reserve.conf' <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/python3 /usr/local/bin/drime-s3gw -c /etc/drime-s3gw/config.toml usage --pbs-comment %i --reserve-file /mnt/datastore/drime/.drime-usage/reserve
+EOF
 systemctl daemon-reload && systemctl enable --now drime-s3gw-usage@drime.timer
 ```
+
+Skip the drop-in if you only want the comment.
 
 - **The limit:** `max_total_size` (e.g. `"1TiB"`) caps what the gateway stores. Once it's reached:
   - New chunks are refused with `403 QuotaExceeded`, so the backup fails with a clear error and your
@@ -171,18 +196,10 @@ systemctl daemon-reload && systemctl enable --now drime-s3gw-usage@drime.timer
 - **Warning before the limit:** above `usage_warn_percent` (default 90%), the usage unit exits 1 about
   once a day. Hook an `OnFailure=` alert to it.
 
-**Optional: show the Drime usage in the PBS gauge itself.** Put the cache directory on a sparse ext4
-image whose size equals `max_total_size`, and let the usage timer fallocate a reservation file so the
-filesystem reports the Drime usage as "used":
-
-```bash
-zfs set mountpoint=/var/lib/pbs-drime-img rpool/pbs-drime-cache   # cache dataset becomes the image's home
-truncate -s 3T /var/lib/pbs-drime-img/cache.img
-mkfs.ext4 -F -m 0 -N 1000000 -I 256 -J size=64 -E lazy_itable_init=1,lazy_journal_init=1 /var/lib/pbs-drime-img/cache.img
-echo '/var/lib/pbs-drime-img/cache.img /mnt/pbs-drime-cache ext4 loop,nofail,x-systemd.requires-mounts-for=/var/lib/pbs-drime-img 0 0' >> /etc/fstab
-# move the datastore's metadata into it (PBS stopped), then:
-# drime-s3gw usage --pbs-comment drime --reserve-file /mnt/pbs-drime-cache/.drime-usage/reserve
-```
+**How the gauge works:** PBS reads `statfs()` of the cache directory.
+- **"Total":** on the sparse image, this is the image size, which equals your limit.
+- **"Used":** the usage timer `fallocate`s `.drime-usage/reserve` so that it matches what is stored on
+  Drime.
 
 How it stays light on the SSD:
 - **No real data:** `fallocate` only allocates blocks; nothing is written.
@@ -191,6 +208,24 @@ How it stays light on the SSD:
   `-N 1000000` is plenty.
 
 The reservation always leaves at least 2 GiB available, so PBS's own cache keeps working.
+
+### Bandwidth limits
+
+Set these in `config.toml`, e.g. to leave room on your line for other traffic:
+
+```toml
+upload_limit = "200Mbit"     # or "25MiB" (per second); "" = unlimited
+download_limit = "500Mbit"
+```
+
+- **What they cover:** all traffic between the gateway and Drime. That includes backups, the
+  read-back check after uploads, verify, restores, read-ahead and scrub.
+- **How they work:** one shared byte-rate bucket per direction, inside the gateway process.
+  Separate commands such as `scrub` or `backup-index` run in their own process and have their own
+  bucket.
+- **How strictly:** the long-run rate never exceeds the cap; individual transfers can still burst.
+- **Alternative:** PBS's own endpoint options (`--rate-in`, `--rate-out`) also work, but they only
+  cover PBS's traffic to the gateway, not the gateway's own checks.
 
 ### Hardening
 
