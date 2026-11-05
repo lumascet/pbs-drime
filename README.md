@@ -249,6 +249,12 @@ systemctl enable --now drime-s3gw-scrub.timer drime-s3gw-index-backup.timer
 - **Encryption key:** back it up off the host, e.g.
   `proxmox-backup-client key paperkey /etc/pve/priv/storage/<storage>.enc --output-format text`
   into your password manager. Without it, the backups on Drime cannot be restored.
+- **Occasional local copy (optional):** to also keep a copy that doesn't depend on Drime, add an
+  ordinary local datastore and a separate, less frequent vzdump job that backs up straight to it,
+  e.g. schedule `sun *-1..7 20:00` (first Sunday of the month). Use the same encryption key, so one
+  key restores both. A PBS *sync job* from
+  the Drime datastore would work too, but it downloads every chunk from Drime. The direct job
+  reads the guests locally instead.
 
 ## How it maps to Drime
 
