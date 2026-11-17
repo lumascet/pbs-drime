@@ -636,6 +636,22 @@ class GatewayTest(unittest.TestCase):
         self.assertEqual(len(self.store.get(k)[1]), before[k])
         self.assertEqual(self.mstate.auth_leaks, 0)
 
+    def test_short_lived_connections_dont_leak(self):
+        # each PBS connection is its own thread; its sqlite connection and Drime sockets must be
+        # closed once it ends (0.8.0 leaked them until the 1024 open-file limit was hit)
+        d = hashlib.sha256(b"leak").hexdigest()
+        key = f".chunks/{d[:4]}/{d}"
+        self.assertEqual(self.pbs.request("PUT", key, body=b"leak")[0], 200)
+        for _ in range(60):
+            c = PBSClient(self.port)
+            self.assertEqual(c.request("GET", key)[0], 200)
+            c.conn.close()
+        time.sleep(0.5)
+        self.pbs.request("HEAD", key)  # a new thread's first use reaps the ended ones
+        live = sum(1 for t in threading.enumerate() if t.is_alive())
+        self.assertLessEqual(len(self.store.index.conns), live)
+        self.assertLessEqual(len(self.store.drime.http.pools), live)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

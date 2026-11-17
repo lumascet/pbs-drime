@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -207,21 +207,63 @@ class ByteRate:
             time.sleep(wait)
 
 
+class PerThread:
+    """One resource per thread, closed explicitly once its thread has ended.
+
+    The S3 server runs one short-lived thread per PBS connection. Python does not reliably
+    close a dead thread's thread-local sqlite connection or sockets (3.13 leaks them), so
+    after enough PBS reconnects the gateway hit its 1024 open-file limit. Each time a new
+    resource is created, those owned by threads that have ended are closed."""
+
+    def __init__(self, make, close):
+        self.make, self.close = make, close
+        self.local = threading.local()
+        self.lock = threading.Lock()
+        self.owned: list = []  # (thread, resource)
+
+    def get(self):
+        r = getattr(self.local, "r", None)
+        if r is None:
+            r = self.local.r = self.make()
+            with self.lock:
+                self.owned.append((threading.current_thread(), r))
+            self.reap()
+        return r
+
+    def reap(self) -> int:
+        with self.lock:
+            dead = [o for o in self.owned if not o[0].is_alive()]
+            if dead:
+                self.owned = [o for o in self.owned if o[0].is_alive()]
+        for _, r in dead:
+            try:
+                self.close(r)
+            except Exception:  # noqa: BLE001
+                pass
+        return len(dead)
+
+    def __len__(self) -> int:
+        return len(self.owned)
+
+
 class HTTP:
     """Keep-alive connections per thread and host; redirects drop auth across hosts."""
 
     def __init__(self, timeout: float, up: "ByteRate | None" = None, down: "ByteRate | None" = None):
         self.timeout = timeout
-        self.local = threading.local()
+        self.pools = PerThread(dict, self._close_pool)
         self.ctx = ssl.create_default_context()
         self.up = up or ByteRate(0)
         self.down = down or ByteRate(0)
 
+    @staticmethod
+    def _close_pool(pool: dict) -> None:
+        for conn in list(pool.values()):
+            conn.close()
+        pool.clear()
+
     def _pool(self) -> dict:
-        pool = getattr(self.local, "pool", None)
-        if pool is None:
-            pool = self.local.pool = {}
-        return pool
+        return self.pools.get()
 
     def _conn(self, scheme: str, netloc: str) -> http.client.HTTPConnection:
         pool = self._pool()
@@ -570,17 +612,19 @@ class Index:
         self.path = path
         d = os.path.dirname(os.path.abspath(path))
         os.makedirs(d, exist_ok=True)
-        self.local = threading.local()
+        self.conns = PerThread(self._connect, lambda c: c.close())
         self._c().executescript(SCHEMA)
 
-    def _c(self) -> sqlite3.Connection:
-        c = getattr(self.local, "conn", None)
-        if c is None:
-            c = sqlite3.connect(self.path, timeout=60, isolation_level=None)
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=FULL")
-            self.local.conn = c
+    def _connect(self) -> sqlite3.Connection:
+        # check_same_thread=False only so PerThread can close it after its thread ended;
+        # it is still used by one thread at a time.
+        c = sqlite3.connect(self.path, timeout=60, isolation_level=None, check_same_thread=False)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=FULL")
         return c
+
+    def _c(self) -> sqlite3.Connection:
+        return self.conns.get()
 
     def get(self, key: str) -> Obj | None:
         r = self._c().execute("SELECT key,size,etag,mtime,entry_id,url,hash FROM objects WHERE key=?",
@@ -1571,14 +1615,21 @@ class Stats:
                 n = sum(self.count.values())
                 if n:
                     log.info("stats %ds: %s | in %.1f MiB/s out %.1f MiB/s | inflight now %d peak %d | "
-                             "avg latency %.0f ms", self.interval,
+                             "avg latency %.0f ms | open files %s", self.interval,
                              " ".join(f"{k}={v}" for k, v in sorted(self.count.items())),
                              self.bytes_in / MiB / self.interval, self.bytes_out / MiB / self.interval,
-                             self.inflight, self.peak, 1000 * self.latency / n)
+                             self.inflight, self.peak, 1000 * self.latency / n, _open_files())
                 self._reset()
             extra = self.extra() if self.extra else ""
             if extra:
                 log.info("stats %ds: %s", self.interval, extra)
+
+
+def _open_files() -> str:
+    try:
+        return str(len(os.listdir("/proc/self/fd")))
+    except OSError:
+        return "?"
 
 
 def _x(s) -> str:
