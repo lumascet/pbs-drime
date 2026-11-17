@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import email.utils
 import hashlib
 import hmac
@@ -35,7 +36,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.8.2"
+__version__ = "0.9.0"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -77,7 +78,11 @@ class Config:
     requests_per_minute: int = 6000  # Drime reports x-ratelimit-limit: 10000 (per minute)
     max_inflight: int = 64  # more made Drime slower and drop connections in tests
     retries: int = 6
-    http_timeout: float = 300.0
+    http_timeout: float = 60.0  # per Drime HTTP attempt (chunks are <= 4 MiB)
+    # Longest time one S3 request from PBS may spend on Drime, retries included; after that
+    # it fails with 503. Keeps an unresponsive Drime from stalling PBS for many minutes.
+    # 0 = no limit.
+    request_deadline: float = 150.0
     max_object_size: int = 256 * MiB
     prefill_chunk_folders: bool = True
     # After each upload: true/"exists" reads one byte back (data present, size right);
@@ -127,11 +132,33 @@ class S3Error(Exception):
         self.status, self.code, self.message = status, code, message or code
 
 
+_REQ = threading.local()  # per S3 request: .deadline (time.monotonic()) or None
+
+
+def _time_left() -> float | None:
+    d = getattr(_REQ, "deadline", None)
+    return None if d is None else d - time.monotonic()
+
+
 class DrimeError(Exception):
     def __init__(self, status: int, message: str):
         where = f"HTTP {status}" if status else "connection error"
         super().__init__(f"Drime {where}: {message}")
         self.status, self.message = status, message
+
+
+class DeadlineExceeded(DrimeError):
+    """The S3 request's request_deadline ran out; never retried."""
+
+    def __init__(self):
+        super().__init__(0, "gave up: request_deadline reached (Drime unresponsive or too slow)")
+
+
+def _check_deadline() -> float | None:
+    left = _time_left()
+    if left is not None and left <= 0:
+        raise DeadlineExceeded()
+    return left
 
 
 def _err_text(data: bytes) -> str:
@@ -296,6 +323,11 @@ class HTTP:
             u = urllib.parse.urlsplit(url)
             target = (u.path or "/") + (("?" + u.query) if u.query else "")
             conn = self._conn(u.scheme, u.netloc)
+            left = _check_deadline()
+            t = self.timeout if left is None else max(1.0, min(self.timeout, left))
+            conn.timeout = t  # used when (re)connecting
+            if conn.sock is not None:
+                conn.sock.settimeout(t)
             if body:
                 self.up.consume(len(body))
             try:
@@ -344,6 +376,10 @@ class Drime:
                 delay = max(delay, min(300.0, float(retry_after)))
             except ValueError:
                 pass
+        left = _check_deadline()
+        if left is not None and delay >= left:
+            time.sleep(max(0.0, left))
+            raise DeadlineExceeded()
         time.sleep(delay)
 
     def call(self, method, path="", *, url=None, params=None, json_body=None, body=None,
@@ -363,11 +399,14 @@ class Drime:
         attempt = 0
         while True:
             attempt += 1
+            _check_deadline()
             if rate_limited:
                 self.limiter.acquire()
             try:
                 status, rh, data = self.http.request(method, url, body, hdrs)
             except (OSError, http.client.HTTPException) as e:
+                if isinstance(e, TimeoutError) or "timed out" in str(e):
+                    _check_deadline()  # a timeout that used up the deadline ends here
                 if retry == "all" and attempt <= self.cfg.retries:
                     log.debug("drime %s %s: %s, retrying", method, path or "<url>", e)
                     self.backoff(attempt)
@@ -858,7 +897,8 @@ class ReadAhead:
             ent = self.cache.get(key)
             ev = self.pending.get(key) if ent is None else None
         if ev is not None:
-            ev.wait(300)
+            left = _time_left()
+            ev.wait(300 if left is None else max(0.0, min(300.0, left)))
             with self.lock:
                 ent = self.cache.get(key)
         if ent is not None:
@@ -952,11 +992,15 @@ class ReadAhead:
 
     def _prefetch(self, key: str, st: _Stream) -> None:
         data = None
+        dl = float(self.store.cfg.request_deadline or 0)
+        _REQ.deadline = time.monotonic() + dl if dl > 0 else None
         try:
             if not st.dead and self.store.index.get(key) is not None:
                 data = self.store.download_key(key)
         except Exception as e:  # noqa: BLE001 - the real request will fetch it itself
             log.debug("prefetch of %s failed: %s", key, e)
+        finally:
+            _REQ.deadline = None
         with self.lock:
             if data is not None:
                 self.cache[key] = [data, 0, st]
@@ -1129,6 +1173,17 @@ class Store:
 
         threading.Thread(target=run, name="prefill", daemon=True).start()
 
+    @contextlib.contextmanager
+    def _slot(self):
+        """One of the max_inflight Drime transfer slots; waiting also respects the deadline."""
+        left = _check_deadline()
+        if not self.inflight.acquire(timeout=left):
+            raise DeadlineExceeded()
+        try:
+            yield
+        finally:
+            self.inflight.release()
+
     def _create_folder(self, parent, name) -> int:
         attempt = 0
         while True:
@@ -1136,7 +1191,7 @@ class Store:
             try:
                 return int(self.drime.create_folder(name, parent)["id"])
             except DrimeError as e:
-                if (e.status and e.status < 500) or attempt > self.cfg.retries:
+                if isinstance(e, DeadlineExceeded) or (e.status and e.status < 500) or attempt > self.cfg.retries:
                     raise
                 log.warning("creating folder %r failed (%s); checking whether it exists", name, e)
                 self.drime.backoff(attempt)
@@ -1150,7 +1205,7 @@ class Store:
         lost = 0
         mode = str(self.cfg.verify_uploads).lower()
         while True:
-            with self.inflight:  # only the upload itself takes one of the max_inflight slots
+            with self._slot():  # only the upload itself takes one of the max_inflight slots
                 item = self._upload_once(folders, dname, payload, exclude)
             if mode in ("false", "off", "0", "no") or self._landed(item, payload, full=mode == "full"):
                 if lost:
@@ -1214,7 +1269,7 @@ class Store:
                     stale_folder_retry = False
                     continue
                 ambiguous = e.status == 0 or e.status >= 500
-                if not ambiguous or attempt > self.cfg.retries:
+                if isinstance(e, DeadlineExceeded) or not ambiguous or attempt > self.cfg.retries:
                     raise
                 log.warning("upload of %s failed (%s); checking whether it landed anyway", dname, e)
                 self.drime.backoff(attempt)
@@ -1291,7 +1346,7 @@ class Store:
     def _download(self, o: Obj) -> bytes:
         key = o.key
         problem = ""
-        with self.inflight:
+        with self._slot():
             for _ in range(3):
                 try:
                     data = self.drime.download(o.url, o.hash)
@@ -1352,7 +1407,7 @@ class Store:
         objs = [o for o in (self.index.get(k) for k in keys) if o is not None]
         if not objs:
             return
-        with self.inflight:
+        with self._slot():
             self.drime.delete([o.entry_id for o in objs], self.cfg.hard_delete)
         for o in objs:
             with self._key_lock(o.key):
@@ -1746,9 +1801,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._status = "?"
         t0 = time.monotonic()
         self.stats.begin()
+        dl = float(self.cfg.request_deadline or 0)
+        _REQ.deadline = t0 + dl if dl > 0 else None
         try:
             self._dispatch_inner(method)
         finally:
+            _REQ.deadline = None
             self.stats.end(method, getattr(self, "_status", "?"), time.monotonic() - t0,
                            int(self.headers.get("Content-Length") or 0), self._sent)
 
@@ -2057,6 +2115,74 @@ def cmd_check(cfg: Config, args) -> int:
     return 0
 
 
+def cmd_probe(cfg: Config, args) -> int:
+    """Quick health check for a vzdump hook: is the gateway answering, and can Drime store,
+    return and delete a small object right now? Exit 0 = go ahead, 1 = don't start a backup.
+    Everything is bounded by --timeout, so a hanging Drime can't hang the caller."""
+    import signal
+    timeout = max(3.0, float(args.timeout))
+    if hasattr(signal, "alarm"):  # hard backstop in case anything blocks outside the deadline
+        def _alarm(*_):
+            print(f"probe FAILED: no result within {timeout + 5:.0f} s")
+            os._exit(1)
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(int(timeout) + 5)
+    t0 = time.monotonic()
+    host = "127.0.0.1" if cfg.listen in ("", "0.0.0.0", "::") else cfg.listen
+    try:  # 1) the gateway itself: TCP + TLS + any HTTP answer (unsigned -> 403 is fine)
+        with socket.create_connection((host, cfg.port), timeout=min(5.0, timeout)) as s:
+            if cfg.tls:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+                s = ctx.wrap_socket(s, server_hostname=host)
+            s.sendall(b"HEAD / HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n")
+            if not s.recv(12).startswith(b"HTTP/1."):
+                raise OSError("no HTTP response")
+    except OSError as e:
+        print(f"probe FAILED: gateway on {host}:{cfg.port} not answering: {e}")
+        return 1
+    t_gw = time.monotonic() - t0
+    # 2) Drime: write, read back, delete a small object through the gateway's own code paths
+    _REQ.deadline = time.monotonic() + timeout - t_gw
+    key = f"_s3gw/probe/{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    data = os.urandom(4096)
+    store = None
+    try:
+        store = _build(cfg)
+        store.put(key, data)
+        t_put = time.monotonic() - t0
+        got = store.get(key)[1]
+        if got != data:
+            raise DrimeError(0, "read-back differs from what was written")
+        store.delete([key])
+        t_done = time.monotonic()
+        # leftovers of earlier failed probes: an upload that hung can still land after the
+        # probe gave up. Best effort, outside the probe's own deadline.
+        _REQ.deadline = time.monotonic() + 15
+        with contextlib.suppress(Exception):
+            old = [o.key for o in store.list("_s3gw/probe/", "", 1000, "")[0]]
+            if old:
+                store.delete(old)
+            folders, _ = key_to_location(key)
+            ids = [int(i["id"]) for i in store.drime.list_children(store.folder_id(folders))
+                   if i.get("type") != "folder"]
+            if ids:
+                store.drime.delete(ids, True)
+                print(f"removed {len(ids)} leftover probe object(s)")
+    except (DrimeError, S3Error, OSError) as e:
+        print(f"probe FAILED after {time.monotonic() - t0:.1f} s: {e}")
+        if store is not None:  # best effort, without a deadline holding it up
+            _REQ.deadline = time.monotonic() + 5
+            with contextlib.suppress(Exception):
+                store.delete([key])
+        return 1
+    finally:
+        _REQ.deadline = None
+    print(f"probe OK in {t_done - t0:.1f} s (gateway {t_gw * 1000:.0f} ms, "
+          f"Drime write {t_put - t_gw:.1f} s, read+delete {t_done - t0 - t_put:.1f} s)")
+    return 0
+
+
 def cmd_selftest(cfg: Config, args) -> int:
     """Round-trip real objects through Drime using the same code paths as the gateway."""
     store = _build(cfg)
@@ -2318,6 +2444,9 @@ def main(argv=None) -> int:
     sub.add_parser("serve", help="run the S3 gateway (default)")
     sub.add_parser("check", help="test the Drime token and show usage")
     sub.add_parser("selftest", help="round-trip test objects through Drime")
+    pr = sub.add_parser("probe", help="quick go/no-go check (gateway + Drime write/read/delete), "
+                                      "e.g. in a vzdump hook before a backup starts")
+    pr.add_argument("--timeout", type=float, default=15.0)
     rb = sub.add_parser("rebuild-index", help="recreate the local index from Drime")
     rb.add_argument("--yes", action="store_true")
     us = sub.add_parser("usage", help="show storage used on Drime (and the limit)")
@@ -2343,7 +2472,7 @@ def main(argv=None) -> int:
         cfg.index_db = args.index_db
     logging.basicConfig(level=getattr(logging, cfg.log_level.upper(), logging.INFO),
                         format="%(asctime)s %(levelname)s %(message)s")
-    cmd = {"serve": cmd_serve, "check": cmd_check, "selftest": cmd_selftest,
+    cmd = {"serve": cmd_serve, "check": cmd_check, "selftest": cmd_selftest, "probe": cmd_probe,
            "rebuild-index": cmd_rebuild, "prefill": cmd_prefill, "usage": cmd_usage,
            "migrate-layout": cmd_migrate,
            "scrub": cmd_scrub, "backup-index": cmd_backup_index,

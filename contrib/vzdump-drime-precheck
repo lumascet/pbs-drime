@@ -1,0 +1,26 @@
+#!/bin/bash
+# vzdump hook script: right before each guest's backup to a Drime-backed PBS storage, check
+# that the gateway answers and that Drime can store, return and delete a small object.
+# If not, the backup of that guest is skipped (vzdump reports it as failed) BEFORE the guest's
+# filesystem is frozen. Without this, PBS can't write the VM config to Drime while QEMU starts
+# the backup, and the guest stays frozen until Proxmox's 125 s timeout.
+#
+# Install: install -m 755 contrib/vzdump-drime-precheck /usr/local/bin/
+#          echo "script: /usr/local/bin/vzdump-drime-precheck" >> /etc/vzdump.conf
+# Storages to check (space-separated PVE storage IDs): DRIME_STORAGES, default "PBS-drime".
+set -u
+phase="${1:-}"
+[ "$phase" = "backup-start" ] || exit 0
+storages="${DRIME_STORAGES:-PBS-drime}"
+case " $storages " in *" ${STOREID:-} "*) ;; *) exit 0 ;; esac
+
+for attempt in 1 2 3; do
+    if out=$(/usr/bin/python3 /usr/local/bin/drime-s3gw -c /etc/drime-s3gw/config.toml probe --timeout 15 2>&1); then
+        echo "drime pre-check: $out"
+        exit 0
+    fi
+    echo "drime pre-check attempt $attempt: $out"
+    [ $attempt -lt 3 ] && sleep 20
+done
+echo "drime pre-check: Drime or the gateway is not working - skipping this backup so the guest isn't frozen"
+exit 1

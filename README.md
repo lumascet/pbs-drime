@@ -295,6 +295,11 @@ systemctl enable --now drime-s3gw-scrub.timer drime-s3gw-index-backup.timer
   - When a failed upload might have been stored anyway, the gateway looks for it on Drime and checks
     its content before adopting it, so retries don't leave duplicates.
   - If Drime is still down after the retries, PBS gets a `503` and retries itself.
+  - No PBS request waits longer than `request_deadline` (default 150 s), retries included. If
+    Drime accepts connections but stops answering, the backup fails within minutes instead of
+    hanging. VM backups should use fleecing (see Hardening), so the guest never waits for this.
+  - Each thread's SQLite connection and Drime sockets are closed when the thread ends. The
+    periodic stats line includes `open files`.
 
 ## Security notes
 

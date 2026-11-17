@@ -32,6 +32,8 @@ class State:
         self.latency = 0.0  # seconds added to every API call (not to storage PUT/GET)
         self.lose_rate = 0.0  # fraction of acknowledged uploads whose data never reaches storage
         self.corrupt_rate = 0.0  # fraction of uploads stored with one flipped byte (same size)
+        self.hang = 0.0  # seconds every request (API and storage) waits before it is answered
+        self.drop_rate = 0.0  # fraction of requests whose connection is closed without a response
         self.calls: dict[str, int] = {}
         self.auth_leaks = 0
         self.alt_host = ""  # host:port used for download redirects
@@ -118,6 +120,11 @@ def make_handler(state: State):
             ep = re.sub(r"/\d+$", "/{id}", re.sub(r"/[0-9a-f]{14}$", "/{hash}", path))
             with state.lock:
                 state.calls[f"{method} {ep}"] = state.calls.get(f"{method} {ep}", 0) + 1
+            if state.hang:  # unresponsive Drime: nothing comes back for a long time
+                time.sleep(state.hang)
+            if state.drop_rate and random.random() < state.drop_rate:
+                self.close_connection = True  # like Drime's "Remote end closed connection"
+                return
             # storage endpoints (presigned / redirect target): no bearer auth expected
             if path.startswith("/presigned/") or path.startswith("/r2/"):
                 if self.headers.get("Authorization"):

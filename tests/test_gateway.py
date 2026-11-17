@@ -652,6 +652,110 @@ class GatewayTest(unittest.TestCase):
         self.assertLessEqual(len(self.store.index.conns), live)
         self.assertLessEqual(len(self.store.drime.http.pools), live)
 
+    def test_stress_faults_short_connections(self):
+        # what broke on 11-11, in fast-forward: many short PBS connections while Drime fails
+        # (500/429, ambiguous 500s after storing, dropped connections). Every chunk must end
+        # up stored intact, and nothing may pile up per ended thread.
+        threads_before = threading.active_count()
+        self.mstate.fail_rate, self.mstate.drop_rate = 0.3, 0.1
+        payloads = {}
+        errors = []
+
+        def worker(w):
+            for i in range(25):
+                data = os.urandom(2048) + f"{w}-{i}".encode()
+                d = hashlib.sha256(data).hexdigest()
+                key = f".chunks/{d[:4]}/{d}"
+                for _ in range(10):  # PBS retries failed chunk uploads
+                    c = PBSClient(self.port)
+                    st = c.request("PUT", key, body=data)[0]
+                    c.conn.close()
+                    if st == 200:
+                        payloads[key] = data
+                        break
+                else:
+                    errors.append(key)
+
+        ts = [threading.Thread(target=worker, args=(w,)) for w in range(16)]
+        try:
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        finally:
+            self.mstate.fail_rate, self.mstate.drop_rate = 0.0, 0.0
+        self.assertEqual(errors, [])
+        self.assertEqual(len(payloads), 400)
+        for key, data in payloads.items():
+            st, _, got = self.pbs.request("GET", key)
+            self.assertEqual((st, got), (200, data), key)
+        time.sleep(0.5)
+        gw.PerThread.reap_all()
+        live = threading.active_count()
+        self.assertLessEqual(len(self.store.index.conns), live)
+        self.assertLessEqual(len(self.store.drime.http.pools), live)
+        self.assertLessEqual(threading.active_count(), threads_before + 4)
+        print(f"\n  400 chunks over 16x25 short connections with 30% Drime errors + 10% drops: "
+              f"all intact; per-thread resources {len(self.store.index.conns)}/"
+              f"{len(self.store.drime.http.pools)}, threads {threads_before}->{live}")
+
+    def test_probe_go_no_go(self):
+        # the vzdump pre-check: 0 when gateway + Drime work, 1 quickly when Drime hangs
+        import argparse
+        cfg = gw.Config(**{f.name: getattr(self.cfg, f.name) for f in gw.fields(gw.Config)})
+        cfg.port = self.port
+        args = argparse.Namespace(timeout=4.0)
+        self.assertEqual(gw.cmd_probe(cfg, args), 0)
+        self.mstate.hang = 8.0
+        try:
+            t0 = time.monotonic()
+            self.assertEqual(gw.cmd_probe(cfg, args), 1)
+            dt = time.monotonic() - t0
+            self.assertLess(dt, 4.0 + 5 + 3)  # deadline + cleanup attempt + slack
+            print(f"\n  probe with unresponsive Drime: no-go after {dt:.1f} s (timeout 4 s)")
+        finally:
+            self.mstate.hang = 0.0
+        time.sleep(8)  # the hung upload lands on the mock after the probe gave up
+        self.assertEqual(gw.cmd_probe(cfg, args), 0)  # ... and the next good probe removes it
+
+        def probe_files():
+            with self.mstate.lock:
+                folders = {e["id"] for e in self.mstate.entries.values()
+                           if e["type"] == "folder" and e["name"] == "probe" and not e["deleted"]}
+                return [e["name"] for e in self.mstate.entries.values()
+                        if e["parent_id"] in folders and not e["deleted"]]
+        self.assertEqual(probe_files(), [])
+        self.assertEqual([o.key for o in self.store.list("_s3gw/probe/", "", 100, "")[0]], [])
+        cfg.port = 1  # nothing listens there
+        self.assertEqual(gw.cmd_probe(cfg, args), 1)
+
+    def test_unresponsive_drime_fails_within_deadline(self):
+        # Drime accepts connections but answers nothing: PBS must get a 503 within
+        # request_deadline, not after http_timeout x retries (could be > 30 min)
+        d = hashlib.sha256(b"deadline-existing").hexdigest()
+        existing = f".chunks/{d[:4]}/{d}"
+        self.assertEqual(self.pbs.request("PUT", existing, body=b"deadline-existing")[0], 200)
+        if self.store.readahead is not None:
+            self.store.readahead.cache.clear()
+        old = (self.cfg.request_deadline, self.store.drime.http.timeout)
+        self.cfg.request_deadline, self.store.drime.http.timeout = 3.0, 2.0
+        self.mstate.hang = 30.0
+        try:
+            dn = hashlib.sha256(b"deadline-new").hexdigest()
+            for method, key, body in (("PUT", f".chunks/{dn[:4]}/{dn}", b"deadline-new"),
+                                      ("GET", existing, b"")):
+                t0 = time.monotonic()
+                c = PBSClient(self.port)
+                st = c.request(method, key, body=body)[0]
+                dt = time.monotonic() - t0
+                c.conn.close()
+                self.assertEqual(st, 503, method)
+                self.assertLess(dt, 8.0, f"{method} took {dt:.1f} s")
+                print(f"\n  unresponsive Drime: {method} -> {st} after {dt:.1f} s (deadline 3 s)")
+        finally:
+            self.mstate.hang = 0.0
+            self.cfg.request_deadline, self.store.drime.http.timeout = old
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
