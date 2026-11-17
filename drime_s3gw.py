@@ -35,7 +35,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape as _xml_escape
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 log = logging.getLogger("drime-s3gw")
 
@@ -213,13 +213,22 @@ class PerThread:
     The S3 server runs one short-lived thread per PBS connection. Python does not reliably
     close a dead thread's thread-local sqlite connection or sockets (3.13 leaks them), so
     after enough PBS reconnects the gateway hit its 1024 open-file limit. Each time a new
-    resource is created, those owned by threads that have ended are closed."""
+    resource is created, and every stats interval (reap_all), those owned by threads that
+    have ended are closed."""
+
+    instances: "list[PerThread]" = []
 
     def __init__(self, make, close):
         self.make, self.close = make, close
         self.local = threading.local()
         self.lock = threading.Lock()
         self.owned: list = []  # (thread, resource)
+        PerThread.instances.append(self)
+
+    @classmethod
+    def reap_all(cls) -> None:
+        for p in list(cls.instances):
+            p.reap()
 
     def get(self):
         r = getattr(self.local, "r", None)
@@ -1611,6 +1620,7 @@ class Stats:
     def _loop(self):
         while True:
             time.sleep(self.interval)
+            PerThread.reap_all()
             with self.lock:
                 n = sum(self.count.values())
                 if n:

@@ -647,7 +647,7 @@ class GatewayTest(unittest.TestCase):
             self.assertEqual(c.request("GET", key)[0], 200)
             c.conn.close()
         time.sleep(0.5)
-        self.pbs.request("HEAD", key)  # a new thread's first use reaps the ended ones
+        gw.PerThread.reap_all()  # what the stats thread does every 10 s
         live = sum(1 for t in threading.enumerate() if t.is_alive())
         self.assertLessEqual(len(self.store.index.conns), live)
         self.assertLessEqual(len(self.store.drime.http.pools), live)
