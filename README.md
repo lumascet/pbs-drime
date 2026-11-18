@@ -19,8 +19,9 @@ It is a single Python file that uses only the standard library, so nothing has t
 hypervisor.
 
 > **Status: in use against a real Drime account with PBS 4.2.**
-> - **Tested on real Drime:** real CT and VM backups, verify, a full CT restore, and a disaster-recovery
->   rebuild of the index from Drime alone.
+> - **Tested on real Drime:** real CT and VM backups, verify, a full CT restore, a full read of a
+>   100 GiB VM disk, a disaster-recovery rebuild of the index from Drime alone, and Drime outages
+>   and gateway restarts during backups (the guest kept running normally every time).
 > - **Drime has silently lost acknowledged uploads before,** which is why every upload is read back
 >   and checked (see below).
 > - **Before you rely on it:** run `drime-s3gw selftest` against your own account; see
@@ -253,6 +254,17 @@ systemctl enable --now drime-s3gw-scrub.timer drime-s3gw-index-backup.timer
   Without fleecing, a guest write to a block that hasn't been backed up yet waits until that
   block has been uploaded to Drime. If Drime is slow, the VM's disk stalls. The fleecing image
   only receives the blocks the guest overwrites during the backup, and it is deleted afterwards.
+- **Pre-check before each guest:** PBS writes the VM config to the datastore *inside* QEMU's
+  `backup` command, which qemu-server gives a fixed 125 s. If Drime is down at that moment, the
+  guest sits frozen (fs-freeze) for that long and the backup fails anyway. Install
+  `contrib/vzdump-drime-precheck` to `/usr/local/bin` and add `script: /usr/local/bin/vzdump-drime-precheck`
+  to `/etc/vzdump.conf`. Before each guest it runs `drime-s3gw probe` (a 4 KiB write, read and
+  delete through Drime, about 2 s), tries 3 times over a minute and skips that guest if Drime isn't
+  working. Set `DRIME_STORAGES` if your PVE storage isn't called `PBS-drime`.
+- **No fs-freeze for guests that can't stand it:** for VMs whose services stall when frozen
+  (e.g. Home Assistant), set `agent: enabled=1,freeze-fs-on-backup=0`. The backup is then crash-
+  consistent instead of filesystem-consistent, which journaling filesystems and SQLite in WAL mode
+  handle. A running VM picks the change up on its next restart; until then it shows as pending.
 - **Occasional local copy (optional):** to also keep a copy that doesn't depend on Drime, add an
   ordinary local datastore and a separate, less frequent vzdump job that backs up straight to it,
   e.g. schedule `sun *-1..7 20:00` (first Sunday of the month). Use the same encryption key, so one
@@ -385,6 +397,9 @@ wait entirely.
     parallel into a RAM cache (`readahead_cache_mib`, default 256).
     - **Measured:** a sequential 1.2 GiB restore read went from 9.9 to **67 MiB/s**, with no
       wasted prefetches.
+    - **Full disk:** reading a complete 100 GiB VM disk back from Drime took 70 min (25 MiB/s on
+      average, 0 errors, 1 read-ahead miss). Zero and repeated chunks go fast; unique data is
+      limited by Drime's download latency. For a fast restore, keep a local copy (see Hardening).
     - **Safeguard:** read-ahead for a snapshot stops if its prefetched chunks go unused.
   - **Drime has slow periods:** at times its download redirect took 5–10 s instead of about 0.1 s,
     and folder creation dropped to about 1 per second.
