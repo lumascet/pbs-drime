@@ -387,6 +387,9 @@ wait entirely.
     - **The read-back check:** it runs outside the 64 upload slots, so it doesn't reduce the number
       of uploads in progress.
     - **Beyond 64 uploads at once:** Drime gets slower and starts dropping connections.
+    - **The ceiling is the line, not Drime:** with 32–128 uploads in flight, through the API or straight
+      to Drime's storage, throughput stays at 25–28 MiB/s (210–235 Mbit/s), close to a plain
+      upload test of the same line (256 Mbit/s). The full read-back check doesn't lower it.
   - **Verify:** with 32 readers, verify read at about 100 MiB/s (about 800–900 Mbit/s), with small
     chunks too. A real 7 GiB CT verified in 67 s. Read-ahead stays out of verify jobs; it only
     follows single sequential readers.
@@ -397,9 +400,10 @@ wait entirely.
     parallel into a RAM cache (`readahead_cache_mib`, default 256).
     - **Measured:** a sequential 1.2 GiB restore read went from 9.9 to **67 MiB/s**, with no
       wasted prefetches.
-    - **Full disk:** reading a complete 100 GiB VM disk back from Drime took 70 min (25 MiB/s on
-      average, 0 errors, 1 read-ahead miss). Zero and repeated chunks go fast; unique data is
-      limited by Drime's download latency. For a fast restore, keep a local copy (see Hardening).
+    - **Full disk:** a restore read of a 100 GiB VM disk from Drime runs at about 66 MiB/s, against
+      105 MiB/s from a local datastore. The gateway answers each chunk from read-ahead in 1–2 ms;
+      the rest is PBS fetching chunks one at a time. A restore that overlaps a verify job shares the
+      link with it and gets much slower (25 MiB/s measured), so don't schedule them together.
     - **Safeguard:** read-ahead for a snapshot stops if its prefetched chunks go unused.
   - **Drime has slow periods:** at times its download redirect took 5–10 s instead of about 0.1 s,
     and folder creation dropped to about 1 per second.
